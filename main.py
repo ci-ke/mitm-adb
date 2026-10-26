@@ -13,6 +13,7 @@
     uv run main.py 10.1.162.244:6556 --upstream http://127.0.0.1:7897   # 再走本机上游代理
     uv run main.py --passive                    # 被动模式：只监听端口，设备自己设代理（iOS 用这个）
     uv run main.py --passive --listen-host 192.168.1.5   # 被动模式，只绑某一块网卡
+    uv run main.py --passive --no-browser        # 不自动开浏览器（默认会开）
 
 三层可见性，逐层收窄（decrypt ⊆ probe ⊆ capture）:
     capture  记录谁——命中的连接都会出现在列表里。不写 = 什么都不记录，写 * = 全记。
@@ -49,12 +50,13 @@
            写 <序列号>:<端口> = 先经该 USB 设备把端口转发到本机回环，再 connect 回环地址
         2. adb reverse tcp:8080 tcp:8080  （设备本地 8080 → PC 的 8080，走 adb 隧道）
         3. 把设备全局代理指向 127.0.0.1:8080
-        4. 启动 mitmweb，浏览器界面在 http://127.0.0.1:8081
+        4. 启动 mitmweb，浏览器界面在 http://127.0.0.1:8081（默认自动打开，
+           地址带 token；不想开就加 --no-browser）
         5. Ctrl+C 退出时自动还原代理、撤销隧道
 
     [被动模式 --passive] 完全不碰设备，等它自己连过来
         1. 只在本机监听代理端口（默认 0.0.0.0，局域网可达），不连 adb
-        2. 启动 mitmweb
+        2. 启动 mitmweb 并自动打开 Web UI
         3. 设备上手动把 HTTP 代理指到 <PC 的 IP>:<端口>，横幅里会打出该填哪个地址
         没有设备可碰，所以退出时也无需还原任何东西。iOS（没有 adb）走这条路；
         安卓上不方便开 USB 调试时同样能用，只是证书得自己装。
@@ -77,6 +79,7 @@
     解出的 JSON 里若带 updatedResources.userMysekaiHarvestMaps，会扫一遍掉落物，
     命中预设的几种稀有素材时，该条 flow 的标记变成「🔴编号」，
     并在红圈左边显示素材图标（webui/hits.js 注入 mitmweb 前端）。
+    只在 Web UI 里体现，控制台不打印命中记录——连续采集时那会把屏刷掉。
 
 不落盘，不写 flows 文件。
 """
@@ -116,7 +119,8 @@ if TYPE_CHECKING:
 
 # mitmproxy 11 起 ctx.log 已弃用，官方建议直接用标准 logging。
 # 注意：mitmweb 只把 WARNING 以上放行到根 logger（mitmproxy 自带的 CLI 才会把根
-# logger 调到 DEBUG），所以 info 级别必须在本 logger 上显式定级，否则会被静默吞掉。
+# logger 调到 DEBUG），所以这里显式定到 INFO——目前只用 warning/debug，留着是为了
+# 以后加 info 日志时不会被静默吞掉。
 logger = logging.getLogger("mitm-adb")
 logger.setLevel(logging.INFO)
 
@@ -684,12 +688,6 @@ class ResponseDecrypt:
             ctx.master.addons.get("view").add([dup])
         except Exception as e:  # pragma: no cover
             logger.warning(f"解密副本注入失败: {e}")
-            return
-
-        hit_id = dup.marked[1:] if dup.marked.startswith("🔴") else ""
-        if hit_id in HITS:
-            names = "、".join(f"{i['name']}×{i['count']}" for i in HITS[hit_id]["items"])
-            logger.info(f"稀有素材：{names}（{HITS[hit_id]['path']}）")
 
 
 class TunnelRecorder:
@@ -748,6 +746,43 @@ def _index_html(webapp: ModuleType) -> str:
     if "/local/hits.js" in html:
         return html
     return html.replace("</head>", _INJECT + "</head>", 1)
+
+
+class OpenBrowser:
+    """Web 服务起来之后，用带 token 的地址打开浏览器。
+
+    不直接用 mitmproxy 的 web_open_browser：它的 web_url 在设了 web_password 时
+    会刻意去掉 token（源码注释是"不想把明文密码打出来"），照着打开只会落到 401/403
+    登录页，还得手抄一遍 token。这里自己拼。
+
+    时机也没得选——RunningHook 触发时 WebMaster.running() 里的 http_server.listen()
+    已经跑完了，端口是通的；再早就连不上了。
+    """
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        # 别用 self.done / self.running 这类名字：它们是 mitmproxy 的钩子名，
+        # AddonManager._iter_hooks 用 getattr(addon, hook_name) 取钩子，不区分
+        # 方法还是实例属性。撞名后拿到一个 bool，既不是 callable 也不是 module，
+        # 退出时就会抛 "Addon handler done (...) not callable"。
+        self.opened = False
+
+    def running(self) -> None:
+        if self.opened:
+            return
+        self.opened = True
+        try:
+            import webbrowser
+
+            ok = webbrowser.open(self.url)
+        except Exception as e:  # pragma: no cover - 浏览器打不开不影响抓包
+            logger.debug(f"打开浏览器失败: {e}")
+            return
+        print(
+            "      Web UI  : 已尝试用默认浏览器打开"
+            if ok
+            else "      Web UI  : 没找到可用浏览器，请手动打开上面的地址"
+        )
 
 
 def install_webui() -> bool:
@@ -1125,6 +1160,7 @@ async def _serve(
     secrets: DecryptSecrets | None,
     rules: HostRules,
     emudhra: str | None,
+    open_browser: bool = True,
 ) -> None:
     from mitmproxy.tools.web.master import WebMaster
 
@@ -1138,6 +1174,8 @@ async def _serve(
     master.options.web_host = "127.0.0.1"
     master.options.web_port = web_port
     master.options.web_password = token
+    # 关掉 mitmproxy 自带的自动开浏览器：它的 web_url 在有 web_password 时不带 token，
+    # 打开只会落到登录页。改用下面自己的 OpenBrowser，开的是带 token 的地址。
     master.options.web_open_browser = False
 
     if emudhra:
@@ -1154,11 +1192,17 @@ async def _serve(
         master.addons.add(TunnelRecorder(rules))
         print("      隧道记录: 已启用（未探针的连接只留 host:port）")
 
+    if open_browser:
+        # addons.add 之后新 addon 会立刻收到 configure，running 则等到 master.run() 走到
+        # RunningHook 才触发——那时 web 端口已经 listen 完了
+        master.addons.add(
+            OpenBrowser(f"http://127.0.0.1:{web_port}/?token={token}")
+        )
+
     if decrypt_on and secrets is not None:
         try:
             master.addons.add(ResponseDecrypt(secrets, rules))
             print("      响应解密: 已启用（" + "、".join(rules.effective_decrypt()) + "）")
-            print("      稀有素材: " + "、".join(n for n, _ in RARE_MATERIALS.values()))
         except Exception as e:
             print(f"      响应解密: 加载失败 -> {e}")
 
@@ -1188,6 +1232,7 @@ def start_ui(
     emudhra: str | None,
     listen_host: str = "127.0.0.1",
     passive: bool = False,
+    open_browser: bool = True,
 ) -> None:
     from mitmproxy import options
 
@@ -1211,14 +1256,20 @@ def start_ui(
     print()
     print("=" * 66)
     print(f"  Web UI : http://127.0.0.1:{web_port}/?token={token}")
-    if passive:
-        print(f"  代理   : {listen_host}:{proxy_port}（被动模式，不碰设备）")
-        addrs = local_ipv4_addresses()[:4]
+
+    addrs = local_ipv4_addresses()[:4] if passive else []
+
+    def _print_addrs(port: int) -> None:
+        """把设备侧该填的地址列出来，第一块网卡标出来当作缺省。"""
         for i, ip in enumerate(addrs):
             note = "← 设备上填这个" if i == 0 else "（其余网卡，网段对不上就不用管）"
-            print(f"           {ip}:{proxy_port}  {note}")
+            print(f"           {ip}:{port}  {note}")
         if not addrs:
             print("           没探到局域网地址，用 ipconfig 看一眼本机 IP")
+
+    if passive:
+        print(f"  代理   : {listen_host}:{proxy_port}（被动模式，不碰设备）")
+        _print_addrs(proxy_port)
     else:
         print(f"  代理   : 127.0.0.1:{proxy_port}（设备侧经 adb reverse 接入）")
     print(f"  上游   : {upstream or '直连'}")
@@ -1238,12 +1289,22 @@ def start_ui(
     else:
         print("  解密   : 关闭（DECRYPT_HOSTS 为空）")
     if secrets is not None and rules.effective_decrypt():
-        print(f"  素材   : {'、'.join(n for n, _ in RARE_MATERIALS.values())}（命中行：红圈左边显示图标）")
+        print(f"  素材   : {'、'.join(n for n, _ in RARE_MATERIALS.values())}")
     print("  Ctrl+C 结束" + ("（被动模式无需还原设备）" if passive else "并自动清理"))
     print("=" * 66)
     print()
 
-    asyncio.run(_serve(opts, web_port, token, secrets, rules, emudhra))
+    asyncio.run(
+        _serve(
+            opts,
+            web_port,
+            token,
+            secrets,
+            rules,
+            emudhra,
+            open_browser=open_browser,
+        )
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1283,6 +1344,7 @@ def run_passive(
     secrets: DecryptSecrets | None,
     rules: HostRules,
     emudhra: str | None,
+    open_browser: bool = True,
 ) -> None:
     """被动模式：不碰设备，只在本机监听代理端口，等设备自己连过来。
 
@@ -1314,6 +1376,7 @@ def run_passive(
             emudhra,
             listen_host=listen_host,
             passive=True,
+            open_browser=open_browser,
         )
     except (OSError, RuntimeError) as e:
         _die(f"启动失败：{e}")
@@ -1409,6 +1472,11 @@ def main() -> None:
         default=None,
         help="代理监听地址（默认主动模式 127.0.0.1、被动模式 0.0.0.0）；可指定某块网卡的 IP",
     )
+    p.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="不自动打开 Web UI（默认会用系统默认浏览器打开带 token 的地址）",
+    )
     cert = p.add_mutually_exclusive_group()
     cert.add_argument(
         "--emudhra",
@@ -1465,6 +1533,7 @@ def main() -> None:
             secrets,
             rules,
             emudhra,
+            open_browser=not args.no_browser,
         )
         return
 
@@ -1502,6 +1571,7 @@ def main() -> None:
             rules,
             emudhra,
             listen_host=args.listen_host or "127.0.0.1",
+            open_browser=not args.no_browser,
         )
     except (OSError, RuntimeError) as e:
         _die(f"启动失败：{e}")
