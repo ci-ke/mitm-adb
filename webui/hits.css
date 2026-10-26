@@ -1,0 +1,39 @@
+/* 稀有素材标记：图标排在红圈左边 */
+.mysk-icons {
+    float: right;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    margin-right: 6px;
+    height: 1.4em;
+}
+
+.mysk-icons img {
+    width: 1.4em;
+    height: 1.4em;
+    object-fit: contain;
+    display: block;
+    border-radius: 3px;
+    /* 深色底上给透明 PNG 一点衬底，浅色主题下也不刺眼 */
+    background: rgba(127, 127, 127, 0.14);
+    box-shadow: 0 0 0 1px rgba(127, 127, 127, 0.25);
+    cursor: help;
+}
+
+.mysk-icons img:hover {
+    transform: scale(1.15);
+    box-shadow: 0 0 0 1px rgba(127, 127, 127, 0.5);
+}
+
+/* 「空白的音色」这类图标本身就是白/透明，浅色主题下会糊成一片，补一圈细描边 */
+@media (prefers-color-scheme: light) {
+    html:not([data-theme="dark"]) .mysk-icons img {
+        background: rgba(0, 0, 0, 0.07);
+        filter: drop-shadow(0 0 0.6px rgba(0, 0, 0, 0.75));
+    }
+}
+
+html[data-theme="light"] .mysk-icons img {
+    background: rgba(0, 0, 0, 0.07);
+    filter: drop-shadow(0 0 0.6px rgba(0, 0, 0, 0.75));
+}

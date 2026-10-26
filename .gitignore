@@ -1,0 +1,26 @@
+# AI 助手的工作区数据（记忆、会话），不入库
+# 若想把项目记忆也版本化，删掉下面这行即可
+.workbuddy/
+
+# 本地敏感配置（密钥等），不入库；模板见 .env.example
+.env
+.env.local
+.env.*.local
+
+# 本地文档/资料，不入库（含抓包笔记，里面会有密钥与实测数据）
+local/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+
+# uv：只提交 pyproject.toml，锁文件不入库
+uv.lock
+
+# 系统
+Thumbs.db
+.DS_Store

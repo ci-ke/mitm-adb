@@ -1,0 +1,20 @@
+[project]
+name = "mitm-adb"
+version = "0.1.0"
+description = "平板 / 虚拟机 MITM 抓包：特定响应解密 + 稀有素材识别"
+requires-python = ">=3.12"
+dependencies = [
+    "mitmproxy>=12.3",  # --emudhra（免装证书）从 12.3 才有
+    "msgpack>=1.0",
+    "pycryptodome>=3.19",
+    "python-dotenv>=1.2.4",
+]
+
+[tool.mypy]
+python_version = "3.12"
+# 函数签名必须写全注解（本仓库只有一个脚本，要求全量覆盖）
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_return_any = true
+warn_unused_ignores = true
