@@ -10,6 +10,7 @@
     uv run main.py 192.168.1.23:37015           # 物理平板（无线调试）
     uv run main.py R58M1234AB --emudhra         # 物理平板（USB 直连，免装证书）
     uv run main.py R58M1234AB:6556              # 虚拟机（经物理平板 USB 转发，不依赖网络）
+    uv run main.py 10.1.162.244:6556 --upstream http://127.0.0.1:7897   # 再走本机上游代理
 
 三层可见性，逐层收窄（decrypt ⊆ probe ⊆ capture）:
     capture  记录谁——命中的连接都会出现在列表里。没被换证书的只有一条 TCP 记录，
@@ -1114,6 +1115,39 @@ def start_ui(
 
 # --------------------------------------------------------------------------
 
+def resolve_upstream(value: str) -> str | None:
+    """把 --upstream 解析成 mitmproxy 认的地址。
+
+    mitmproxy 的 upstream 模式只支持 http / https（`mode_specs.UpstreamMode`
+    写死了 scheme），所以 socks5 得提前拦下来说清楚，否则要到 Options 构造时
+    才抛 ValueError，栈全打出来。
+    """
+    lowered = value.strip().lower()
+    if lowered == "none":
+        return None
+    if lowered == "auto":
+        # Windows 上大写更常见（os.environ 在那边大小写不敏感，两种写法都读同一个值），
+        # ALL_PROXY 是 Clash / mihomo 这类客户端的兜底项
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            raw = (os.environ.get(name) or os.environ.get(name.lower()) or "").strip()
+            if not raw:
+                continue
+            if raw.startswith("http"):
+                return raw
+            print(f"[配置] {name}={raw} 不是 http/https，跳过（上游只支持 http/https）")
+        return None
+
+    if value.startswith("socks"):
+        _die(
+            f"上游 {value} 是 socks，mitmproxy 的 upstream 模式只支持 http / https。"
+            "Clash / mihomo 这类客户端同一个端口通常两种协议都收，"
+            "写成 http://127.0.0.1:7897 就行"
+        )
+    if not value.startswith("http"):
+        _die(f"上游 {value} 看不懂：写 http://127.0.0.1:7897 这种形式，或 none 表示直连")
+    return value
+
+
 def main() -> None:
     # 让日志即时显示（即使被重定向到文件/管道）
     for stream in (sys.stdout, sys.stderr):
@@ -1169,7 +1203,10 @@ def main() -> None:
     p.add_argument(
         "--upstream",
         default="auto",
-        help="上游代理：auto=读 $http_proxy（默认）| none=直连 | http://127.0.0.1:7897",
+        help=(
+            "上游代理：auto=读环境变量 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY（默认）"
+            " | none=直连 | http://127.0.0.1:7897（只支持 http / https）"
+        ),
     )
     p.add_argument("--adb", default=None, help="adb 可执行文件路径（默认从 PATH 找）")
     p.add_argument(
@@ -1197,15 +1234,7 @@ def main() -> None:
 
     rules = load_host_rules()
     secrets = None if args.no_decrypt else load_secrets()
-
-    if args.upstream == "auto":
-        upstream = os.environ.get("http_proxy") or os.environ.get("HTTPS_PROXY") or None
-        if upstream and not upstream.startswith("http"):
-            upstream = None
-    elif args.upstream.lower() == "none":
-        upstream = None
-    else:
-        upstream = args.upstream
+    upstream = resolve_upstream(args.upstream)
 
     ensure_device(adb, target)
 
