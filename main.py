@@ -4,24 +4,36 @@
 
 用法:
     uv sync
-    cp .env.example .env   # 填上 CAPTURE_KEY / CAPTURE_IV
+    cp .env.example .env   # 填上 DECRYPT_KEY / DECRYPT_IV
     uv run main.py --list                       # 先看设备序列号（USB 插着才有）
     uv run main.py 10.1.162.244:6556            # 虚拟机（局域网，adbd 固定 6556）
     uv run main.py 192.168.1.23:37015           # 物理平板（无线调试）
     uv run main.py R58M1234AB --emudhra         # 物理平板（USB 直连，免装证书）
     uv run main.py R58M1234AB:6556              # 虚拟机（经物理平板 USB 转发，不依赖网络）
 
+三层可见性，逐层收窄（decrypt ⊆ probe ⊆ capture）:
+    capture  记录谁——命中的连接都会出现在列表里。没被换证书的只有一条 TCP 记录，
+             能看到 host:port 和连接时间，内容仍是密文。
+    probe    其中谁换证书——只有这些看得到明文，才有机会解密。
+    decrypt  其中谁再解一层——AES 解出可读副本。
+    所以 PROBE_HOSTS 留空就是纯侦察模式：什么都不换证书，设备完全不受打扰，
+    列表里照样能看到这台设备都连了哪些域名。先跑一轮看清单，再挑目标填进
+    PROBE_HOSTS 就能看明文了。
+
 配置:
     密钥等敏感信息只放在本目录的 .env（已在 .gitignore 里，不入库），模板见 .env.example。
     以下都可用同名真实环境变量覆盖（环境变量优先级更高）:
-        CAPTURE_KEY     AES-128 密钥，16 字节
-        CAPTURE_IV      AES-128 IV，16 字节
-        CAPTURE_HOSTS   要拦截的主机，必填，逗号分隔
-        CAPTURE_IGNORE  排除名单，命中的连接原样隧道（先匹配 CAPTURE_HOSTS 再排除）
-        DECRYPT_HOSTS   只对这些尝试解密；留空表示跟 CAPTURE_HOSTS 一样
+        DECRYPT_KEY      AES-128 密钥，16 字节
+        DECRYPT_IV       AES-128 IV，16 字节
+        CAPTURE_HOSTS    记录谁，默认 *（全记）
+        CAPTURE_IGNORE   连记录都不要
+        PROBE_HOSTS      换证书谁，留空 = 纯侦察
+        PROBE_IGNORE     不换证书，但仍留一条 TCP 记录
+        DECRYPT_HOSTS    解密谁，留空 = 跟 PROBE_HOSTS 一样
+        DECRYPT_IGNORE   只看明文，不解包
 
-    三份名单写法一致（代码里不内置任何域名，全部来自 .env）:
-        *               全部（CAPTURE_HOSTS=* 就是全抓）
+    六份名单写法一致（代码里不内置任何域名，全部来自 .env）:
+        *               全部
         .example.com    这个域连同所有子域
         api.example.com 只匹配这一条主机名
     .env 缺失或缺密钥时，脚本照常抓包，只是自动关掉响应解密。
@@ -39,10 +51,10 @@
     加上 --emudhra 后改用 mitmproxy 内置的 eMudhra 泄露中间 CA 私钥现场签发：
     叶证书 → EM OV TLS CA - G3C →（Sectigo 交叉签名）→ AAA Certificate Services，
     这条根是设备出厂就信任的，所以**不需要往设备装任何证书**。
-    代价是只有这里签的域名能被解密，所以同时只会拦截 CAPTURE_HOSTS 里的域名，
+    代价是只有这里签的域名能被解密，所以同时只会对 PROBE_HOSTS 里的域名换证书，
     其余流量原样隧道直通（别的 App 不会因为证书不受信而报错）。
-    另外 SDK / 埋点类端点客户端自带证书校验（pin 或自带信任库），拦下来会在握手中被拒，
-    把这几个域名写进 CAPTURE_IGNORE 放行，让它们直接连真服务器。
+    另外 SDK / 埋点类端点客户端自带证书校验（pin 或自带信任库），一旦探针到就会在
+    握手中被拒，把这些域名写进 PROBE_IGNORE 放行，让它们直接连真服务器。
 
 响应解密:
     请求体与响应体都是 AES-128-CBC(msgpack)。解出的明文会以「副本」形式注入 Web UI，
@@ -77,7 +89,7 @@ from typing import TYPE_CHECKING, Any, NoReturn, TypedDict, cast
 
 import msgpack  # type: ignore[import-untyped]  # 上游没带 py.typed
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
+from Crypto.Util.Padding import unpad
 from dotenv import load_dotenv
 
 if TYPE_CHECKING:
@@ -85,6 +97,7 @@ if TYPE_CHECKING:
 
     import mitmproxy.http as http
     import mitmproxy.options as options
+    import mitmproxy.tcp as tcp
 
 
 # mitmproxy 11 起 ctx.log 已弃用，官方建议直接用标准 logging。
@@ -104,7 +117,7 @@ ENV_FILE: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 # AES-128-CBC 的 key/iv 长度都是 16 字节
 AES_KEY_LEN: int = 16
 
-# 域名规则一律写在 .env 里（CAPTURE_HOSTS / CAPTURE_IGNORE / DECRYPT_HOSTS），
+# 域名规则一律写在 .env 里（PROBE_HOSTS / PROBE_IGNORE / DECRYPT_HOSTS），
 # 代码里不内置任何域名——换游戏、换服只要改配置，不用动脚本。
 
 # 解密副本在列表里显示的标记（mitmweb 会渲染在 Path 列）
@@ -112,7 +125,7 @@ MARKER: str = "[dec]"
 
 
 @dataclass(frozen=True)
-class CaptureSecrets:
+class DecryptSecrets:
     """从 .env 读出的加解密参数。"""
 
     key: bytes
@@ -122,7 +135,7 @@ class CaptureSecrets:
 def load_env(env_file: str = ENV_FILE) -> None:
     """把 .env 灌进 os.environ。
 
-    override=False：已经存在的真实环境变量优先，方便临时用 CAPTURE_KEY=... 覆盖，
+    override=False：已经存在的真实环境变量优先，方便临时用 DECRYPT_KEY=... 覆盖，
     CI 里也不必生成 .env 文件。
     """
     if not os.path.isfile(env_file):
@@ -144,14 +157,14 @@ def _read_secret(name: str) -> bytes | None:
     return value
 
 
-def load_secrets() -> CaptureSecrets | None:
+def load_secrets() -> DecryptSecrets | None:
     """key 与 iv 都合法才返回；否则返回 None（等同于不启用解密）。"""
-    key = _read_secret("CAPTURE_KEY")
-    iv = _read_secret("CAPTURE_IV")
+    key = _read_secret("DECRYPT_KEY")
+    iv = _read_secret("DECRYPT_IV")
     if key is None or iv is None:
         print("[配置] 没有可用的密钥 -> 本次不启用响应解密（模板见 .env.example）")
         return None
-    return CaptureSecrets(key=key, iv=iv)
+    return DecryptSecrets(key=key, iv=iv)
 
 
 def _split_hosts(raw: str) -> tuple[str, ...]:
@@ -165,6 +178,8 @@ def host_matches(host: str, entry: str) -> bool:
         *              全抓
         .example.com   这个域及其所有子域
         a.b.com        只匹配这一条
+
+    只比主机名本身：路径、查询串、端口都不在这个字符串里。
     """
     host = host.strip().lower()
     entry = entry.strip().lower()
@@ -191,50 +206,144 @@ def host_patterns(hosts: tuple[str, ...]) -> list[str]:
     return out
 
 
+def _warn_non_host_entries(name: str, hosts: tuple[str, ...]) -> None:
+    """名单只认主机名：带路径 / 查询串 / 端口的条目永远匹配不上，提前喊一声。
+
+    mitmproxy 判定 allow/ignore 时还没解析 HTTP，手上只有 SNI、Host 头和
+    「主机:端口」，路径和查询串根本不存在，所以这些字符写进去必然是死规则。
+    """
+    for entry in hosts:
+        if any(ch in entry for ch in "/?#: "):
+            print(
+                f"[配置] {name} 里的 {entry} 带了路径 / 查询串 / 端口，永远匹配不上——"
+                "这里只写主机名（端口由脚本自动补）；按路径过滤请用 mitmweb 的过滤框"
+            )
+
+
 @dataclass(frozen=True)
 class HostRules:
-    """抓什么 / 解密什么 / 排除什么。
+    """三层，自上而下逐层收窄：decrypt ⊆ probe ⊆ capture。
 
-    顺序就是 mitmproxy 的顺序：先看 capture（命中才拦），再看 skip（命中就放行），
-    两边都不命中的连接一律原样隧道。
+        capture  记录谁——命中的连接都会出现在列表里
+        probe    其中谁换证书——只有这些看得到明文
+        decrypt  其中谁再解一层——AES 解出可读副本
+
+    每层都配一条 ignore 做例外：
+        capture_ignore  连记录都不留（连 capture 都进不来）
+        probe_ignore    不换证书，但留一条 TCP 记录（还在 capture 里）
+        decrypt_ignore  能看到明文，但不去解包（还在 probe 里）
+
+    mitmproxy 本身只有 allow/ignore 一对判定，capture 这层是靠 show_ignored_hosts
+    把隧道连接也记下来、再按 capture 名单裁剪实现的（见 TunnelRecorder）。
     """
 
     capture: tuple[str, ...]
+    capture_ignore: tuple[str, ...]
+    probe: tuple[str, ...]
+    probe_ignore: tuple[str, ...]
     decrypt: tuple[str, ...]
-    skip: tuple[str, ...]
+    decrypt_ignore: tuple[str, ...]
+
+    @staticmethod
+    def _matches(entries: tuple[str, ...], host: str) -> bool:
+        return any(host_matches(host, e) for e in entries)
 
     def allow_patterns(self) -> list[str]:
-        """给 mitmproxy 的 allow_hosts：命中才拦截。"""
-        return host_patterns(self.capture)
+        """给 mitmproxy 的 allow_hosts：命中才换证书。"""
+        if not self.probe:
+            # allow_hosts 为空时 mitmproxy 会当成"没有限制"从而全拦，
+            # 纯侦察模式必须给一条永不匹配的规则，让所有连接都落到隧道分支。
+            return [r"(?!)"]
+        return host_patterns(self.probe)
 
     def ignore_patterns(self) -> list[str]:
-        """给 mitmproxy 的 ignore_hosts：命中就放行（在 allow 之后判定）。"""
-        return host_patterns(self.skip)
+        """给 mitmproxy 的 ignore_hosts：命中的一律走隧道。
+
+        capture_ignore 和 probe_ignore 在这里合成一个集合，区别在事后：
+        probe_ignore 留一条 TCP 记录，capture_ignore 连这条也要删掉。
+        """
+        return host_patterns(self.capture_ignore + self.probe_ignore)
+
+    def should_record(self, host: str) -> bool:
+        """这条连接要不要出现在列表里。"""
+        return self._matches(self.capture, host) and not self._matches(
+            self.capture_ignore, host
+        )
 
     def should_decrypt(self, host: str) -> bool:
         """这条连接要不要尝试解密。"""
-        return any(host_matches(host, e) for e in self.decrypt)
+        return self._matches(self.decrypt, host) and not self._matches(
+            self.decrypt_ignore, host
+        )
 
-    def describe(self) -> str:
-        return "、".join(self.capture) or "（空）"
+
+def _covered(entry: str, by: tuple[str, ...]) -> bool:
+    """entry 这条规则是否被 by 这组规则整体覆盖（用于检查子集关系）。"""
+    if "*" in by:
+        return True
+    bare = entry[1:] if entry.startswith(".") else entry
+    return any(host_matches(bare, b) for b in by)
+
+
+def _check_subset(lower: str, lower_hosts: tuple[str, ...], upper: str, upper_hosts: tuple[str, ...]) -> None:
+    """下层名单里出现了上层没覆盖的域名时提醒一句——那不是错误，但肯定是配置写歪了。"""
+    for entry in lower_hosts:
+        if not _covered(entry, upper_hosts):
+            print(
+                f"[配置] {lower} 里的 {entry} 不在 {upper} 范围内，"
+                f"实际不会生效（{upper} 决定这一层的上限）"
+            )
 
 
 def load_host_rules() -> HostRules:
-    """从环境变量（.env）读三份名单，代码里不内置任何域名。
+    """从环境变量（.env）读六份名单，代码里不内置任何域名。
 
-        CAPTURE_HOSTS   要拦截的主机，必填，`*` = 全抓
-        CAPTURE_IGNORE  排除，命中就原样隧道；不写或留空表示不排除
-        DECRYPT_HOSTS   只对这些尝试解密；留空 = 跟 CAPTURE_HOSTS 一样
+        CAPTURE_HOSTS / CAPTURE_IGNORE   记录谁 / 连记录都不要
+        PROBE_HOSTS   / PROBE_IGNORE     换证书谁 / 不换证书但留记录
+        DECRYPT_HOSTS / DECRYPT_IGNORE   解密谁 / 只看明文不解包
+
+    CAPTURE_HOSTS 缺省即 `*`（全记）；PROBE_HOSTS 留空 = 纯侦察，什么都不换证书；
+    DECRYPT_HOSTS 留空 = 跟 PROBE_HOSTS 一样。
+
+    六份名单都只写主机名，不能带路径、查询串或端口——mitmproxy 判定 allow/ignore
+    时还没解析 HTTP，路径根本不存在；端口由 host_patterns() 自动补。
     """
-    capture = _split_hosts(os.environ.get("CAPTURE_HOSTS", ""))
-    if not capture:
-        _die(
-            "CAPTURE_HOSTS 没配。在 .env 里写要抓的主机（逗号分隔，* 表示全抓），"
-            "模板见 .env.example"
-        )
-    skip = _split_hosts(os.environ.get("CAPTURE_IGNORE", ""))
-    decrypt = _split_hosts(os.environ.get("DECRYPT_HOSTS", "")) or capture
-    return HostRules(capture=capture, decrypt=decrypt, skip=skip)
+    capture = _split_hosts(os.environ.get("CAPTURE_HOSTS", "")) or ("*",)
+    capture_ignore = _split_hosts(os.environ.get("CAPTURE_IGNORE", ""))
+    probe = _split_hosts(os.environ.get("PROBE_HOSTS", ""))
+    probe_ignore = _split_hosts(os.environ.get("PROBE_IGNORE", ""))
+    decrypt = _split_hosts(os.environ.get("DECRYPT_HOSTS", "")) or probe
+    decrypt_ignore = _split_hosts(os.environ.get("DECRYPT_IGNORE", ""))
+
+    for name, entries in (
+        ("CAPTURE_HOSTS", capture),
+        ("CAPTURE_IGNORE", capture_ignore),
+        ("PROBE_HOSTS", probe),
+        ("PROBE_IGNORE", probe_ignore),
+        ("DECRYPT_HOSTS", decrypt),
+        ("DECRYPT_IGNORE", decrypt_ignore),
+    ):
+        _warn_non_host_entries(name, entries)
+
+    _check_subset("PROBE_HOSTS", probe, "CAPTURE_HOSTS", capture)
+    _check_subset("DECRYPT_HOSTS", decrypt, "PROBE_HOSTS", probe)
+
+    return HostRules(
+        capture=capture,
+        capture_ignore=capture_ignore,
+        probe=probe,
+        probe_ignore=probe_ignore,
+        decrypt=decrypt,
+        decrypt_ignore=decrypt_ignore,
+    )
+
+
+def _describe(hosts: tuple[str, ...], ignore: tuple[str, ...]) -> str:
+    """横幅里一行显示一层名单：主名单 + 排除项。"""
+    text = "、".join(hosts) or "（空）"
+    if ignore:
+        text += "    排除 " + "、".join(ignore)
+    return text
 
 
 # --------------------------------------------------------------------------
@@ -378,25 +487,15 @@ def register_hit(found: dict[int, HitRecord], flow: http.HTTPFlow) -> str:
     return hit_id
 
 
-def _decrypt_aes_cbc(data: bytes, secrets: CaptureSecrets) -> bytes:
+def _decrypt_aes_cbc(data: bytes, secrets: DecryptSecrets) -> bytes:
     return unpad(
         AES.new(secrets.key, AES.MODE_CBC, secrets.iv).decrypt(data), AES.block_size
     )
 
 
-def _encrypt_aes_cbc(data: bytes, secrets: CaptureSecrets) -> bytes:
-    return AES.new(secrets.key, AES.MODE_CBC, secrets.iv).encrypt(
-        pad(data, AES.block_size)
-    )
-
-
-def decode_payload(data: bytes, secrets: CaptureSecrets) -> dict[str, Any]:
+def decode_payload(data: bytes, secrets: DecryptSecrets) -> dict[str, Any]:
     plain = _decrypt_aes_cbc(data, secrets)
     return cast(dict[str, Any], msgpack.unpackb(plain, raw=False))
-
-
-def encode_payload(data: dict[str, Any], secrets: CaptureSecrets) -> bytes:
-    return _encrypt_aes_cbc(msgpack.packb(data, use_bin_type=True), secrets)
 
 
 def _json_default(o: Any) -> str:
@@ -418,7 +517,7 @@ def to_json_bytes(obj: Any) -> bytes:
 class ResponseDecrypt:
     """生成解密副本注入 UI；原 flow 不动，避免影响客户端与服务器之间的字节。"""
 
-    def __init__(self, secrets: CaptureSecrets, rules: HostRules) -> None:
+    def __init__(self, secrets: DecryptSecrets, rules: HostRules) -> None:
         self.secrets = secrets
         self.rules = rules
 
@@ -488,6 +587,36 @@ class ResponseDecrypt:
         if hit_id in HITS:
             names = "、".join(f"{i['name']}×{i['count']}" for i in HITS[hit_id]["items"])
             logger.info(f"稀有素材：{names}（{HITS[hit_id]['path']}）")
+
+
+class TunnelRecorder:
+    """把隧道连接的记录压到最小：留 host:port，不留内容，不在 capture 里的直接丢掉。
+
+    mitmproxy 的 show_ignored_hosts 一开就是全局的——所有被放行的连接都会记一条，
+    但 capture 名单可能只想留其中一部分，所以这里在 flow 建立时按名单裁剪。
+    另外 mitmproxy 默认把整条流的所有字节都缓存进 flow.messages（官方文档也提醒了
+    这会显著吃内存），抓半小时能堆到几百 MB，所以除第一条（TLS ClientHello）外
+    收到就丢——列表里照样能看到连接和去向。
+    """
+
+    def __init__(self, rules: HostRules) -> None:
+        self.rules = rules
+
+    def tcp_start(self, flow: tcp.TCPFlow) -> None:
+        address = flow.server_conn.address
+        host = address[0] if address else ""
+        if self.rules.should_record(host):
+            return
+        try:
+            from mitmproxy import ctx
+
+            ctx.master.commands.call("view.flows.remove", [flow])
+        except Exception as e:  # pragma: no cover
+            logger.debug(f"过滤隧道记录失败: {e}")
+
+    def tcp_message(self, flow: tcp.TCPFlow) -> None:
+        if len(flow.messages) > 1:
+            del flow.messages[1:]
 
 
 # --------------------------------------------------------------------------
@@ -878,7 +1007,7 @@ async def _serve(
     opts: options.Options,
     web_port: int,
     token: str,
-    secrets: CaptureSecrets | None,
+    secrets: DecryptSecrets | None,
     rules: HostRules,
     emudhra: str | None,
 ) -> None:
@@ -904,6 +1033,10 @@ async def _serve(
         # 赋值会立刻触发 tlsconfig.configure()，把 certstore 的签发 CA 换成泄露的中间 CA
         setattr(master.options, emudhra, True)
         print(f"      证书: {emudhra} 模式（设备端无需安装证书）")
+
+    if rules.capture:
+        master.addons.add(TunnelRecorder(rules))
+        print("      隧道记录: 已启用（未探针的连接只留 host:port）")
 
     if secrets is not None:
         try:
@@ -934,7 +1067,7 @@ def start_ui(
     web_port: int,
     token: str,
     upstream: str | None,
-    secrets: CaptureSecrets | None,
+    secrets: DecryptSecrets | None,
     rules: HostRules,
     emudhra: str | None,
 ) -> None:
@@ -944,11 +1077,13 @@ def start_ui(
     if upstream:
         # mode 是核心选项，必须在构造时就给定，事后再赋不会生效
         opts_kwargs["mode"] = [f"upstream:{upstream}"]
-    # 先按 capture 决定拦谁，再按 skip 排除（mitmproxy 内部就是这个顺序），
-    # 两边都不命中的连接原样隧道出去。
+    # allow_hosts 决定谁换证书，ignore_hosts 决定谁连隧道都别进（两层 ignore 合成一个集合，
+    # 事后再按 capture 名单把不该留的删掉），show_ignored_hosts 让隧道连接也留一条记录。
     opts_kwargs["allow_hosts"] = rules.allow_patterns()
-    if rules.skip:
-        opts_kwargs["ignore_hosts"] = rules.ignore_patterns()
+    ignore = rules.ignore_patterns()
+    if ignore:
+        opts_kwargs["ignore_hosts"] = ignore
+    opts_kwargs["show_ignored_hosts"] = bool(rules.capture)
     opts = options.Options(
         listen_host="127.0.0.1", listen_port=proxy_port, **opts_kwargs
     )
@@ -962,10 +1097,12 @@ def start_ui(
         print(f"  证书   : {emudhra}（设备端无需安装证书）")
     else:
         print("  证书   : mitmproxy 自带 CA（设备侧必须已信任，虚拟机里才做得到）")
-    print(f"  拦截   : {rules.describe()}")
-    if rules.skip:
-        print(f"  排除   : {'、'.join(rules.skip)}（命中就原样隧道，不拦不解密）")
-    print(f"  解密   : {'、'.join(rules.decrypt) if secrets is not None else '关闭（没配密钥）'}")
+    print(f"  记录   : {_describe(rules.capture, rules.capture_ignore)}")
+    print(f"  探针   : {_describe(rules.probe, rules.probe_ignore)}")
+    if secrets is not None:
+        print(f"  解密   : {_describe(rules.decrypt, rules.decrypt_ignore)}")
+    else:
+        print("  解密   : 关闭（没配密钥）")
     if secrets is not None:
         print(f"  素材   : {'、'.join(n for n, _ in RARE_MATERIALS.values())}（命中行：红圈左边显示图标）")
     print("  Ctrl+C 结束并自动清理")
