@@ -13,24 +13,25 @@
     uv run main.py 10.1.162.244:6556 --upstream http://127.0.0.1:7897   # 再走本机上游代理
 
 三层可见性，逐层收窄（decrypt ⊆ probe ⊆ capture）:
-    capture  记录谁——命中的连接都会出现在列表里。没被换证书的只有一条 TCP 记录，
-             能看到 host:port 和连接时间，内容仍是密文。
+    capture  记录谁——命中的连接都会出现在列表里。不写 = 什么都不记录，写 * = 全记。
+             probe 是在这层结果里再挑，所以 capture 空的时候 probe 也不会有任何作用。
+             没被换证书的连接只有一条 TCP 记录，能看到 host:port 和连接时间，内容仍是密文。
     probe    其中谁换证书——只有这些看得到明文，才有机会解密。
     decrypt  其中谁再解一层——AES 解出可读副本。
-    所以 PROBE_HOSTS 留空就是纯侦察模式：什么都不换证书，设备完全不受打扰，
-    列表里照样能看到这台设备都连了哪些域名。先跑一轮看清单，再挑目标填进
-    PROBE_HOSTS 就能看明文了。
+    所以 CAPTURE_HOSTS=* + PROBE_HOSTS 留空就是纯侦察模式：什么都不换证书，
+    设备完全不受打扰，列表里照样能看到这台设备都连了哪些域名。先跑一轮看清单，
+    再挑目标填进 PROBE_HOSTS 就能看明文了。
 
 配置:
     密钥等敏感信息只放在本目录的 .env（已在 .gitignore 里，不入库），模板见 .env.example。
     以下都可用同名真实环境变量覆盖（环境变量优先级更高）:
         DECRYPT_KEY      AES-128 密钥，16 字节
         DECRYPT_IV       AES-128 IV，16 字节
-        CAPTURE_HOSTS    记录谁，默认 *（全记）
+        CAPTURE_HOSTS    记录谁，留空 = 什么都不记录，* = 全记
         CAPTURE_IGNORE   连记录都不要
-        PROBE_HOSTS      换证书谁，留空 = 纯侦察
+        PROBE_HOSTS      换证书谁（只能从 capture 里挑），留空 = 什么都不换证书
         PROBE_IGNORE     不换证书，但仍留一条 TCP 记录
-        DECRYPT_HOSTS    解密谁，留空 = 跟 PROBE_HOSTS 一样
+        DECRYPT_HOSTS    解密谁，留空 = 不解密，* = 全部 probe 的
         DECRYPT_IGNORE   只看明文，不解包
 
     六份名单写法一致（代码里不内置任何域名，全部来自 .env）:
@@ -229,10 +230,10 @@ class HostRules:
         probe    其中谁换证书——只有这些看得到明文
         decrypt  其中谁再解一层——AES 解出可读副本
 
-    每层都配一条 ignore 做例外：
-        capture_ignore  连记录都不留（连 capture 都进不来）
-        probe_ignore    不换证书，但留一条 TCP 记录（还在 capture 里）
-        decrypt_ignore  能看到明文，但不去解包（还在 probe 里）
+    每层都配一条 ignore，只剔自己这一层的命中；被上层剔掉的，下层自然也就没有：
+        capture_ignore  不记录，也不会被 probe（capture 是入口）
+        probe_ignore    不换证书，仍在 capture 里，留一条 TCP 记录
+        decrypt_ignore  不解包，仍在 probe 里，明文照样可见
 
     mitmproxy 本身只有 allow/ignore 一对判定，capture 这层是靠 show_ignored_hosts
     把隧道连接也记下来、再按 capture 名单裁剪实现的（见 TunnelRecorder）。
@@ -249,33 +250,108 @@ class HostRules:
     def _matches(entries: tuple[str, ...], host: str) -> bool:
         return any(host_matches(host, e) for e in entries)
 
+    def effective_capture(self) -> tuple[str, ...]:
+        """capture 层生效的记录范围：剔掉 capture_ignore 之后。"""
+        return _minus(self.capture, self.capture_ignore)
+
+    def effective_probe(self) -> tuple[str, ...]:
+        """probe 层真正生效的条目：在 capture 的结果里挑，再剔掉 probe_ignore。
+
+        probe 是从 capture 命中的集合里再挑一层，capture 空就等于什么都没记录，
+        probe 写了也没用；capture 写了具体域名时，越界的 probe 条目直接丢掉。
+        """
+        return _minus(
+            _intersect(self.probe, self.effective_capture()), self.probe_ignore
+        )
+
+    def effective_decrypt(self) -> tuple[str, ...]:
+        """decrypt 同理，只能从 probe 的结果里挑。"""
+        return _minus(
+            _intersect(self.decrypt, self.effective_probe()), self.decrypt_ignore
+        )
+
     def allow_patterns(self) -> list[str]:
         """给 mitmproxy 的 allow_hosts：命中才换证书。"""
-        if not self.probe:
+        effective = self.effective_probe()
+        if not effective:
             # allow_hosts 为空时 mitmproxy 会当成"没有限制"从而全拦，
-            # 纯侦察模式必须给一条永不匹配的规则，让所有连接都落到隧道分支。
+            # 没有 probe 目标时必须给一条永不匹配的规则，让所有连接都落到隧道分支。
             return [r"(?!)"]
-        return host_patterns(self.probe)
+        return host_patterns(effective)
 
     def ignore_patterns(self) -> list[str]:
-        """给 mitmproxy 的 ignore_hosts：命中的一律走隧道。
+        """给 mitmproxy 的 ignore_hosts：命中的不换证书、直接走隧道。
 
-        capture_ignore 和 probe_ignore 在这里合成一个集合，区别在事后：
-        probe_ignore 留一条 TCP 记录，capture_ignore 连这条也要删掉。
+        capture_ignore 也在里面：capture 是入口层，入口就被剔掉的域名 probe 自然
+        无从谈起——不然"不记录"根本兑现不了，MITM 之后必然生成 HTTPFlow。
+        另外 probe 写 `*` 时没法用减法表达"除了 xxx 之外全部"，也靠这一层挡。
         """
         return host_patterns(self.capture_ignore + self.probe_ignore)
 
+    def _hit(self, entries: tuple[str, ...], ignore: tuple[str, ...], host: str) -> bool:
+        """本层名单命中、且没被本层 ignore 剔掉。三层都用这一个判断。
+
+        不能用 `_matches(effective_xxx(), host)` 代替：`*` 做不了集合减法，
+        effective 里会原样保留 `*`，那样 ignore 就失效了。
+        """
+        return self._matches(entries, host) and not self._matches(ignore, host)
+
     def should_record(self, host: str) -> bool:
-        """这条连接要不要出现在列表里。"""
-        return self._matches(self.capture, host) and not self._matches(
-            self.capture_ignore, host
+        """这条连接要不要出现在列表里（探针命中的天然算，跑不过这里）。"""
+        return self._hit(self.capture, self.capture_ignore, host)
+
+    def should_probe(self, host: str) -> bool:
+        """这条连接要不要换证书：probe 命中，且没被 capture 那层剔掉。"""
+        return self._hit(self.probe, self.probe_ignore, host) and self.should_record(
+            host
         )
 
     def should_decrypt(self, host: str) -> bool:
-        """这条连接要不要尝试解密。"""
-        return self._matches(self.decrypt, host) and not self._matches(
-            self.decrypt_ignore, host
-        )
+        """这条连接要不要尝试解密：decrypt 命中，且整条链路都没被剔掉。"""
+        return self._hit(
+            self.decrypt, self.decrypt_ignore, host
+        ) and self.should_probe(host)
+
+    @property
+    def needs_tunnel_record(self) -> bool:
+        """要把隧道连接也记下来吗。
+
+        capture 留空 = 不额外记录。只要还存在会走隧道的连接就得开：
+        probe 没覆盖满 capture，或者有 ignore 把某些域名踢出了 probe。
+        """
+        if not self.capture:
+            return False
+        if self.capture != self.effective_probe():
+            return True
+        return bool(self.capture_ignore or self.probe_ignore)
+
+
+def _intersect(lower: tuple[str, ...], upper: tuple[str, ...]) -> tuple[str, ...]:
+    """下层名单里落在上层范围内的那些条目；上层为空则结果为空。
+
+    `*` 在任一侧都表示"这一层的全部"，所以下层的 `*` 直接取上层的集合，
+    上层的 `*` 则原样放行下层。
+    """
+    if not upper or not lower:
+        return ()
+    if "*" in upper:
+        return lower
+    if "*" in lower:
+        return upper
+    return tuple(e for e in lower if _covered(e, upper))
+
+
+def _minus(entries: tuple[str, ...], ignore: tuple[str, ...]) -> tuple[str, ...]:
+    """从本层名单里剔掉本层 ignore 命中的条目。
+
+    `*` 没办法用减法表达（"全部除了 x"），遇到就原样保留，交给 mitmproxy 的
+    ignore_hosts 或下游的逐条判断兜住。
+    """
+    if not entries or not ignore:
+        return entries
+    if "*" in ignore:
+        return ()
+    return tuple(e for e in entries if not _covered(e, ignore))
 
 
 def _covered(entry: str, by: tuple[str, ...]) -> bool:
@@ -289,6 +365,9 @@ def _covered(entry: str, by: tuple[str, ...]) -> bool:
 def _check_subset(lower: str, lower_hosts: tuple[str, ...], upper: str, upper_hosts: tuple[str, ...]) -> None:
     """下层名单里出现了上层没覆盖的域名时提醒一句——那不是错误，但肯定是配置写歪了。"""
     for entry in lower_hosts:
+        if entry == "*":
+            # `*` 在这里是"本层全部"，会被上层收窄，不算越界
+            continue
         if not _covered(entry, upper_hosts):
             print(
                 f"[配置] {lower} 里的 {entry} 不在 {upper} 范围内，"
@@ -303,17 +382,20 @@ def load_host_rules() -> HostRules:
         PROBE_HOSTS   / PROBE_IGNORE     换证书谁 / 不换证书但留记录
         DECRYPT_HOSTS / DECRYPT_IGNORE   解密谁 / 只看明文不解包
 
-    CAPTURE_HOSTS 缺省即 `*`（全记）；PROBE_HOSTS 留空 = 纯侦察，什么都不换证书；
-    DECRYPT_HOSTS 留空 = 跟 PROBE_HOSTS 一样。
+    三层默认值语义一致：留空 = 这一层什么都不做，写 `*` = 覆盖上层给的全部范围。
+    所以 CAPTURE_HOSTS 留空时 PROBE_HOSTS 写了也不生效（capture 是入口）；
+    DECRYPT_HOSTS 留空就是不启用解密，要解全部得写 `*`。
+    每层的 ignore 只剔自己这一层的命中：上层剔掉的，下层自然也没有；越界的条目
+    （probe 不在 capture 里、decrypt 不在 probe 里）会被直接丢掉并提醒。
 
     六份名单都只写主机名，不能带路径、查询串或端口——mitmproxy 判定 allow/ignore
     时还没解析 HTTP，路径根本不存在；端口由 host_patterns() 自动补。
     """
-    capture = _split_hosts(os.environ.get("CAPTURE_HOSTS", "")) or ("*",)
+    capture = _split_hosts(os.environ.get("CAPTURE_HOSTS", ""))
     capture_ignore = _split_hosts(os.environ.get("CAPTURE_IGNORE", ""))
     probe = _split_hosts(os.environ.get("PROBE_HOSTS", ""))
     probe_ignore = _split_hosts(os.environ.get("PROBE_IGNORE", ""))
-    decrypt = _split_hosts(os.environ.get("DECRYPT_HOSTS", "")) or probe
+    decrypt = _split_hosts(os.environ.get("DECRYPT_HOSTS", ""))
     decrypt_ignore = _split_hosts(os.environ.get("DECRYPT_IGNORE", ""))
 
     for name, entries in (
@@ -1014,8 +1096,9 @@ async def _serve(
 ) -> None:
     from mitmproxy.tools.web.master import WebMaster
 
-    # secrets 为 None 表示不启用解密（没配密钥或显式 --no-decrypt）
-    if secrets is not None:
+    # secrets 为 None 表示没配密钥；decrypt 名单为空表示这一层没开
+    decrypt_on = secrets is not None and bool(rules.effective_decrypt())
+    if decrypt_on:
         install_webui()
 
     # web_* 选项由 WebAuth addon 注册，必须在 WebMaster 构造之后再赋值
@@ -1035,14 +1118,14 @@ async def _serve(
         setattr(master.options, emudhra, True)
         print(f"      证书: {emudhra} 模式（设备端无需安装证书）")
 
-    if rules.capture:
+    if rules.needs_tunnel_record:
         master.addons.add(TunnelRecorder(rules))
         print("      隧道记录: 已启用（未探针的连接只留 host:port）")
 
-    if secrets is not None:
+    if decrypt_on and secrets is not None:
         try:
             master.addons.add(ResponseDecrypt(secrets, rules))
-            print("      响应解密: 已启用（" + "、".join(rules.decrypt) + "）")
+            print("      响应解密: 已启用（" + "、".join(rules.effective_decrypt()) + "）")
             print("      稀有素材: " + "、".join(n for n, _ in RARE_MATERIALS.values()))
         except Exception as e:
             print(f"      响应解密: 加载失败 -> {e}")
@@ -1078,13 +1161,15 @@ def start_ui(
     if upstream:
         # mode 是核心选项，必须在构造时就给定，事后再赋不会生效
         opts_kwargs["mode"] = [f"upstream:{upstream}"]
-    # allow_hosts 决定谁换证书，ignore_hosts 决定谁连隧道都别进（两层 ignore 合成一个集合，
-    # 事后再按 capture 名单把不该留的删掉），show_ignored_hosts 让隧道连接也留一条记录。
+    # allow_hosts 是 probe 在 capture 结果里再剔掉 probe_ignore 之后的样子；
+    # ignore_hosts 放 capture_ignore + probe_ignore——这两层被排除的都不该换证书，
+    # 而且 probe 写 `*` 时只有这里能表达"除了 xxx 之外全部"；
+    # show_ignored_hosts 让隧道连接也留一条记录，再由 TunnelRecorder 按 capture 裁掉多余的。
     opts_kwargs["allow_hosts"] = rules.allow_patterns()
     ignore = rules.ignore_patterns()
     if ignore:
         opts_kwargs["ignore_hosts"] = ignore
-    opts_kwargs["show_ignored_hosts"] = bool(rules.capture)
+    opts_kwargs["show_ignored_hosts"] = rules.needs_tunnel_record
     opts = options.Options(
         listen_host="127.0.0.1", listen_port=proxy_port, **opts_kwargs
     )
@@ -1100,11 +1185,13 @@ def start_ui(
         print("  证书   : mitmproxy 自带 CA（设备侧必须已信任，虚拟机里才做得到）")
     print(f"  记录   : {_describe(rules.capture, rules.capture_ignore)}")
     print(f"  探针   : {_describe(rules.probe, rules.probe_ignore)}")
-    if secrets is not None:
+    if secrets is None:
+        print("  解密   : 关闭（没配密钥）")
+    elif rules.effective_decrypt():
         print(f"  解密   : {_describe(rules.decrypt, rules.decrypt_ignore)}")
     else:
-        print("  解密   : 关闭（没配密钥）")
-    if secrets is not None:
+        print("  解密   : 关闭（DECRYPT_HOSTS 为空）")
+    if secrets is not None and rules.effective_decrypt():
         print(f"  素材   : {'、'.join(n for n, _ in RARE_MATERIALS.values())}（命中行：红圈左边显示图标）")
     print("  Ctrl+C 结束并自动清理")
     print("=" * 66)
