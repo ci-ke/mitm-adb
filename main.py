@@ -11,6 +11,8 @@
     uv run main.py R58M1234AB --emudhra         # 物理平板（USB 直连，免装证书）
     uv run main.py R58M1234AB:6556              # 虚拟机（经物理平板 USB 转发，不依赖网络）
     uv run main.py 10.1.162.244:6556 --upstream http://127.0.0.1:7897   # 再走本机上游代理
+    uv run main.py --passive                    # 被动模式：只监听端口，设备自己设代理（iOS 用这个）
+    uv run main.py --passive --listen-host 192.168.1.5   # 被动模式，只绑某一块网卡
 
 三层可见性，逐层收窄（decrypt ⊆ probe ⊆ capture）:
     capture  记录谁——命中的连接都会出现在列表里。不写 = 什么都不记录，写 * = 全记。
@@ -40,13 +42,22 @@
         api.example.com 只匹配这一条主机名
     .env 缺失或缺密钥时，脚本照常抓包，只是自动关掉响应解密。
 
-它会做这几件事:
-    1. 连设备：<ip>:<端口> 直接 adb connect；只写序列号 = USB 直连；
-       写 <序列号>:<端口> = 先经该 USB 设备把端口转发到本机回环，再 connect 回环地址
-    2. adb reverse tcp:8080 tcp:8080  （设备本地 8080 → PC 的 8080，走 adb 隧道）
-    3. 把设备全局代理指向 127.0.0.1:8080
-    4. 启动 mitmweb，浏览器界面在 http://127.0.0.1:8081
-    5. Ctrl+C 退出时自动还原代理、撤销隧道
+它会做这几件事（两种模式）:
+
+    [自动模式，默认] 靠 adb 把设备接进来，设备侧不用动手
+        1. 连设备：<ip>:<端口> 直接 adb connect；只写序列号 = USB 直连；
+           写 <序列号>:<端口> = 先经该 USB 设备把端口转发到本机回环，再 connect 回环地址
+        2. adb reverse tcp:8080 tcp:8080  （设备本地 8080 → PC 的 8080，走 adb 隧道）
+        3. 把设备全局代理指向 127.0.0.1:8080
+        4. 启动 mitmweb，浏览器界面在 http://127.0.0.1:8081
+        5. Ctrl+C 退出时自动还原代理、撤销隧道
+
+    [被动模式 --passive] 完全不碰设备，等它自己连过来
+        1. 只在本机监听代理端口（默认 0.0.0.0，局域网可达），不连 adb
+        2. 启动 mitmweb
+        3. 设备上手动把 HTTP 代理指到 <PC 的 IP>:<端口>，横幅里会打出该填哪个地址
+        没有设备可碰，所以退出时也无需还原任何东西。iOS（没有 adb）走这条路；
+        安卓上不方便开 USB 调试时同样能用，只是证书得自己装。
 
 免装证书（--emudhra）:
     默认情况下设备必须信任 mitmproxy 自己的 CA（虚拟机里可以 cp 进系统目录，物理平板没 root 做不到）。
@@ -82,6 +93,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -271,13 +283,21 @@ class HostRules:
         )
 
     def allow_patterns(self) -> list[str]:
-        """给 mitmproxy 的 allow_hosts：命中才换证书。"""
+        """给 mitmproxy 的 allow_hosts：命中才换证书。
+
+        末尾固定补一条 mitm.it：证书下载页（onboarding）只有连接被拦下来才会
+        出现，而 allow_hosts 非空时未命中的域名一律直通，设备就再也打不开
+        http://mitm.it 装证书了。这条与抓包目标无关，纯粹是装证书的入口。
+        """
         effective = self.effective_probe()
         if not effective:
             # allow_hosts 为空时 mitmproxy 会当成"没有限制"从而全拦，
             # 没有 probe 目标时必须给一条永不匹配的规则，让所有连接都落到隧道分支。
-            return [r"(?!)"]
-        return host_patterns(effective)
+            patterns = [r"(?!)"]
+        else:
+            patterns = host_patterns(effective)
+        patterns.append(r"^mitm\.it:\d+$")
+        return patterns
 
     def ignore_patterns(self) -> list[str]:
         """给 mitmproxy 的 ignore_hosts：命中的不换证书、直接走隧道。
@@ -831,6 +851,18 @@ def _die(msg: str) -> NoReturn:
     sys.exit(1)
 
 
+def find_adb(explicit: str | None) -> str:
+    """定位 adb 可执行文件。
+
+    被动模式用不上 adb，所以在真正要操作设备之前才调用——没装
+    platform-tools 的机器（比如只想抓 iOS）不应因为找不到 adb 就退出。
+    """
+    path = explicit or shutil.which("adb")
+    if not path:
+        _die("找不到 adb，请把 platform-tools 加进 PATH，或用 --adb 指定路径")
+    return path
+
+
 def list_devices(adb: str) -> None:
     """列出 adb 认到的设备，并给出每个设备能直接用的 target 写法。
 
@@ -1154,6 +1186,8 @@ def start_ui(
     secrets: DecryptSecrets | None,
     rules: HostRules,
     emudhra: str | None,
+    listen_host: str = "127.0.0.1",
+    passive: bool = False,
 ) -> None:
     from mitmproxy import options
 
@@ -1171,16 +1205,28 @@ def start_ui(
         opts_kwargs["ignore_hosts"] = ignore
     opts_kwargs["show_ignored_hosts"] = rules.needs_tunnel_record
     opts = options.Options(
-        listen_host="127.0.0.1", listen_port=proxy_port, **opts_kwargs
+        listen_host=listen_host, listen_port=proxy_port, **opts_kwargs
     )
 
     print()
     print("=" * 66)
     print(f"  Web UI : http://127.0.0.1:{web_port}/?token={token}")
-    print(f"  代理   : 127.0.0.1:{proxy_port}（设备侧经 adb reverse 接入）")
+    if passive:
+        print(f"  代理   : {listen_host}:{proxy_port}（被动模式，不碰设备）")
+        addrs = local_ipv4_addresses()[:4]
+        for i, ip in enumerate(addrs):
+            note = "← 设备上填这个" if i == 0 else "（其余网卡，网段对不上就不用管）"
+            print(f"           {ip}:{proxy_port}  {note}")
+        if not addrs:
+            print("           没探到局域网地址，用 ipconfig 看一眼本机 IP")
+    else:
+        print(f"  代理   : 127.0.0.1:{proxy_port}（设备侧经 adb reverse 接入）")
     print(f"  上游   : {upstream or '直连'}")
     if emudhra:
         print(f"  证书   : {emudhra}（设备端无需安装证书）")
+    elif passive:
+        print("  证书   : mitmproxy 自带 CA（设备浏览器访问 http://mitm.it 装一次；")
+        print("           iOS 还要在「设置 → 通用 → 关于本机 → 证书信任设置」里打开完全信任）")
     else:
         print("  证书   : mitmproxy 自带 CA（设备侧必须已信任，虚拟机里才做得到）")
     print(f"  记录   : {_describe(rules.capture, rules.capture_ignore)}")
@@ -1193,11 +1239,86 @@ def start_ui(
         print("  解密   : 关闭（DECRYPT_HOSTS 为空）")
     if secrets is not None and rules.effective_decrypt():
         print(f"  素材   : {'、'.join(n for n, _ in RARE_MATERIALS.values())}（命中行：红圈左边显示图标）")
-    print("  Ctrl+C 结束并自动清理")
+    print("  Ctrl+C 结束" + ("（被动模式无需还原设备）" if passive else "并自动清理"))
     print("=" * 66)
     print()
 
     asyncio.run(_serve(opts, web_port, token, secrets, rules, emudhra))
+
+
+# --------------------------------------------------------------------------
+# 被动模式（设备自己把代理指过来）
+# --------------------------------------------------------------------------
+
+
+def local_ipv4_addresses() -> list[str]:
+    """本机可用于局域网访问的 IPv4 地址，默认出口那块网卡排第一。
+
+    先做一次不发包的 UDP "connect"，让内核按默认路由挑一块网卡——多网卡
+    （有线 + 无线 + 虚拟机网卡）时，这才是设备真正够得着的那个；再用
+    getaddrinfo 把其余网卡补上，方便手填到别的网段。
+    """
+    found: list[str] = []
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))  # 只让内核选路由，不会真的发包
+            found.append(sock.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            found.append(cast(tuple[str, int], info[4])[0])
+    except OSError:
+        pass
+    # dict.fromkeys 去重且保序；回环地址设备填了也没用
+    return [ip for ip in dict.fromkeys(found) if not ip.startswith("127.")]
+
+
+def run_passive(
+    proxy_port: int,
+    web_port: int,
+    listen_host: str,
+    token: str,
+    upstream: str | None,
+    secrets: DecryptSecrets | None,
+    rules: HostRules,
+    emudhra: str | None,
+) -> None:
+    """被动模式：不碰设备，只在本机监听代理端口，等设备自己连过来。
+
+    iOS 没有 adb，安卓上也可能不想开 USB 调试，这条路只要求设备能访问到本机。
+    监听地址默认 0.0.0.0——绑 127.0.0.1 的话局域网设备根本连不上。
+    """
+    print(f"[1/2] 监听 {listen_host}:{proxy_port}（被动模式，不连接设备）")
+    if listen_host in ("0.0.0.0", "::", ""):
+        addrs = local_ipv4_addresses()
+        print(
+            "      设备上填："
+            + ("、".join(f"{ip}:{proxy_port}" for ip in addrs) or "（没探到，用 ipconfig 看一眼本机 IP）")
+        )
+        print("      [提示] Windows 第一次监听会弹防火墙，要选「允许访问」，否则设备连不上")
+        print("      [提示] 这等于对局域网开了个无认证代理，公共 Wi-Fi 下别开；")
+        print("             不放心就用 --listen-host 只绑内网那块网卡，或抓完立刻 Ctrl+C")
+    print("      设备侧代理开关（手动填，退出后记得自己关掉）:")
+    print("        iOS  ：设置 → 无线局域网 → 当前网络右侧 (i) → 配置代理 → 手动")
+    print("        安卓 ：WLAN → 长按当前网络 → 修改网络 → 高级 → 代理 → 手动")
+    print("[2/2] 启动 mitmweb")
+    try:
+        start_ui(
+            proxy_port,
+            web_port,
+            token,
+            upstream,
+            secrets,
+            rules,
+            emudhra,
+            listen_host=listen_host,
+            passive=True,
+        )
+    except (OSError, RuntimeError) as e:
+        _die(f"启动失败：{e}")
+    except KeyboardInterrupt:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -1247,7 +1368,7 @@ def main() -> None:
     load_env()
 
     p = argparse.ArgumentParser(
-        description="抓取虚拟机 / 物理平板的流量（adb reverse + mitmweb）",
+        description="抓取虚拟机 / 物理平板 / iOS 的流量（adb reverse 或被动监听 + mitmweb）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "例子:\n"
@@ -1257,6 +1378,7 @@ def main() -> None:
             "  uv run main.py R58M1234AB:6556            # 虚拟机，走平板 USB 转发（不依赖网络）\n"
             "  uv run main.py 10.1.162.244:6556 --web-port 9000\n"
             "  uv run main.py 10.1.162.244:6556 --upstream http://127.0.0.1:7897\n"
+            "  uv run main.py --passive                  # 只监听，设备自己设代理（iOS）\n"
         ),
     )
     p.add_argument(
@@ -1270,8 +1392,22 @@ def main() -> None:
         nargs="?",
         help=(
             "设备地址：<ip>:<端口>（局域网）| USB 序列号（adb devices 里那一列，直连物理机本身）"
-            " | <序列号>:<端口>（经这台 USB 设备转发该端口，用于物理机里的虚拟机）"
+            " | <序列号>:<端口>（经这台 USB 设备转发该端口，用于物理机里的虚拟机）；"
+            " --passive 时不用给"
         ),
+    )
+    p.add_argument(
+        "--passive",
+        action="store_true",
+        help=(
+            "被动模式：不连 adb、不改设备设置，只在本机监听代理端口，"
+            "由设备自己把 HTTP 代理指过来（iOS 等没有 adb 的设备用这个）"
+        ),
+    )
+    p.add_argument(
+        "--listen-host",
+        default=None,
+        help="代理监听地址（默认主动模式 127.0.0.1、被动模式 0.0.0.0）；可指定某块网卡的 IP",
     )
     cert = p.add_mutually_exclusive_group()
     cert.add_argument(
@@ -1303,25 +1439,45 @@ def main() -> None:
     )
     args = p.parse_args()
 
-    adb = args.adb or shutil.which("adb")
-    if not adb:
-        _die("找不到 adb，请把 platform-tools 加进 PATH，或用 --adb 指定路径")
-
+    if args.list and args.passive:
+        _die("--list 是列 adb 设备用的，--passive 不碰 adb，两个别一起给")
     if args.list:
-        list_devices(adb)
+        list_devices(find_adb(args.adb))
         return
-    if not args.target:
-        _die("没给 target。先跑 uv run main.py --list 看有哪些设备，按提示里的写法填")
 
-    target = resolve_target(args.target)
     emudhra = "emudhra_old" if args.emudhra_old else ("emudhra" if args.emudhra else None)
-    if target.connect is None and not emudhra:
-        print("[提示] USB 直连的是物理机本身，装不了系统证书；游戏报网络错误就加 --emudhra")
     token = args.token or token_hex(8)
 
     rules = load_host_rules()
     secrets = None if args.no_decrypt else load_secrets()
     upstream = resolve_upstream(args.upstream)
+
+    # 被动模式：设备自己连过来，adb 全程用不上（没装 platform-tools 也能跑）
+    if args.passive:
+        if args.target:
+            print(f"[提示] 被动模式下不操作设备，target {args.target} 已忽略")
+        run_passive(
+            args.proxy_port,
+            args.web_port,
+            args.listen_host or "0.0.0.0",
+            token,
+            upstream,
+            secrets,
+            rules,
+            emudhra,
+        )
+        return
+
+    adb = find_adb(args.adb)
+    if not args.target:
+        _die(
+            "没给 target。先跑 uv run main.py --list 看有哪些设备，按提示里的写法填；"
+            "只想监听端口让设备自己连过来，就加 --passive"
+        )
+
+    target = resolve_target(args.target)
+    if target.connect is None and not emudhra:
+        print("[提示] USB 直连的是物理机本身，装不了系统证书；游戏报网络错误就加 --emudhra")
 
     ensure_device(adb, target)
 
@@ -1345,6 +1501,7 @@ def main() -> None:
             secrets,
             rules,
             emudhra,
+            listen_host=args.listen_host or "127.0.0.1",
         )
     except (OSError, RuntimeError) as e:
         _die(f"启动失败：{e}")
