@@ -10,6 +10,8 @@
     uv run main.py 192.168.1.23:37015           # 物理平板（无线调试）
     uv run main.py R58M1234AB --emudhra         # 物理平板（USB 直连，免装证书）
     uv run main.py R58M1234AB:6556              # 虚拟机（经物理平板 USB 转发，不依赖网络）
+    uv run main.py --pair 123456                # 首次无线调试：六位配对码，端口自动从 mDNS 找
+    uv run main.py 10.1.152.63:42463 --pair 123456 --pair-port 37123   # 同上，配对端口手给
     uv run main.py 10.1.162.244:6556 --cert-install     # 把系统证书装进设备（装完退出，不重启）
     uv run main.py 10.1.162.244:6556 --cert-install --reboot   # 装完重启、等它回来，接着抓包
     uv run main.py 10.1.162.244:6556 --cert-uninstall   # 把系统证书卸掉
@@ -52,7 +54,8 @@
         0. 给了 --cert-install 就先把 CA 装进系统证书目录（默认装完退出，不重启），
            见下面「设备系统证书」
         1. 连设备：<ip>:<端口> 直接 adb connect；只写序列号 = USB 直连；
-           写 <序列号>:<端口> = 先经该 USB 设备把端口转发到本机回环，再 connect 回环地址
+           写 <序列号>:<端口> = 先经该 USB 设备把端口转发到本机回环，再 connect 回环地址；
+           加 --pair <码> 则先配对（无线调试第一次连必须，见下）
         2. adb reverse tcp:8080 tcp:8080  （设备本地 8080 → PC 的 8080，走 adb 隧道）
         3. 把设备全局代理指向 127.0.0.1:8080
         4. 启动 mitmweb，浏览器界面在 http://127.0.0.1:8081（默认自动打开，
@@ -65,6 +68,16 @@
         3. 设备上手动把 HTTP 代理指到 <PC 的 IP>:<端口>，横幅里会打出该填哪个地址
         没有设备可碰，所以退出时也无需还原任何东西。iOS（没有 adb）走这条路；
         安卓上不方便开 USB 调试时同样能用，只是证书得自己装。
+
+无线调试首次配对（--pair）:
+    Android 11 起，无线调试的连接端口只认设备里已经有的 key，所以换一台没连过的电脑
+    adb connect 一定失败——缺的那一步是配对。平板「无线调试 → 使用配对码配对设备」
+    会再弹一个**另一个端口**和六位码：配对用这两个，连接用主页上的 IP:端口，别混。
+        --pair 123456      用六位码配对；配对端口默认从 mDNS 找，找不到再用 --pair-port
+        --pair-port 37123  手工给配对端口（mDNS 被防火墙/AP 隔离拦掉时才需要，要配 target 用）
+    配对成功后 key 就留在设备里了，之后只 connect；换电脑、删过 ~/.android/adbkey
+    才算重新「第一次」。弹窗一关，配对端口和码立刻作废，一个码只能用一次。
+    不给 target 时连接端口也交给 mDNS（同一台设备靠服务名里的序列号对上）。
 
 设备系统证书（--cert-install / --cert-uninstall）:
     mitmproxy 自己的 CA 得躺在设备的系统证书目录里才会被信任，这两步脚本可以代劳
@@ -940,7 +953,8 @@ def list_devices(adb: str) -> None:
     if not rows:
         print("\n没有设备在线。")
         print("  USB    ：检查数据线（要能传数据）、平板上「允许 USB 调试」是否点过")
-        print("  无线   ：先 adb connect <ip>:<端口>，或看平板开发者选项里的「无线调试」")
+        print("  无线   ：看平板开发者选项里的「无线调试」，用主页上的 IP:端口 adb connect")
+        print("  首次连 ：这台电脑没和它配过对时 connect 一定失败，先 uv run main.py --pair <六位码>")
         return
 
     print("\nadb 认到的设备：")
@@ -948,6 +962,8 @@ def list_devices(adb: str) -> None:
         print(f"  {serial:<22} {state:<14} {model}")
         if state != "device":
             print("    （状态不是 device，先处理授权/掉线，再谈抓包）")
+            if ":" in serial:
+                print(f"    （无线调试没配过对就卡在这：uv run main.py {serial} --pair <六位码>）")
             continue
         if ":" in serial:
             print(f"    -> uv run main.py {serial}")
@@ -1030,6 +1046,161 @@ def _local_key_fingerprint() -> str | None:
         return ":".join(f"{b:02X}" for b in hashlib.md5(blob).digest())
     except Exception:
         return None
+
+
+# 无线调试在 mDNS 里广播的两个服务。配对服务只在「使用配对码配对设备」弹窗开着的
+# 那几分钟里存在，所以能不能看到它，本身就等于「弹窗还开不开着」。
+PAIRING_SERVICE: str = "_adb-tls-pairing._tcp"
+CONNECT_SERVICE: str = "_adb-tls-connect._tcp"
+
+
+@dataclass(frozen=True)
+class MdnsService:
+    """`adb mdns services` 里的一条记录。"""
+
+    name: str
+    """服务实例名，形如 adb-e8da2b9d-CNVj6b。"""
+
+    kind: str
+    """PAIRING_SERVICE（配对）或 CONNECT_SERVICE（连接）。"""
+
+    address: str
+    """ip:端口，可以直接喂给 adb pair / adb connect。"""
+
+    @property
+    def host(self) -> str:
+        return self.address.rpartition(":")[0]
+
+    @property
+    def device_id(self) -> str:
+        """服务名中间那段，就是设备序列号；用来把配对和连接记录对到同一台设备上。"""
+        parts = self.name.split("-")
+        return parts[1] if len(parts) > 1 else self.name
+
+
+def mdns_services(adb: str, kind: str) -> list[MdnsService]:
+    """列出 adb 通过 mDNS 看到的一类服务。
+
+    设备只在开着无线调试时广播。mDNS 被禁用、被防火墙拦、路由器开了 AP 隔离，
+    这里都会是空的——空只代表「自动找」这条路走不通，不代表设备没开。
+    """
+    r = _run([adb, "mdns", "services"])
+    found: list[MdnsService] = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[1] == kind and ":" in parts[2]:
+            found.append(MdnsService(parts[0], parts[1], parts[2]))
+    return found
+
+
+def _pairing_service(adb: str, target: Target | None) -> MdnsService:
+    """从 mDNS 里挑出这次要配对的那台设备。"""
+    services = mdns_services(adb, PAIRING_SERVICE)
+    if not services:
+        _die(
+            "mDNS 里没有正在等配对的服务。按顺序确认：\n"
+            "       1) 平板「无线调试」→「使用配对码配对设备」，弹窗要一直开着（关掉码和端口立刻作废）\n"
+            "       2) PC 和设备在同一个局域网，路由器没开 AP 隔离\n"
+            "       3) 绕开 mDNS 手工给端口：uv run main.py <ip>:<连接端口> --pair <码> --pair-port <配对端口>\n"
+            "          两个端口不是同一个：配对端口在弹窗里，连接端口在无线调试主页"
+        )
+    if target is not None and target.connect is not None:
+        host = target.connect.rpartition(":")[0]
+        on_host = [s for s in services if s.host == host]
+        if on_host:
+            services = on_host
+    if len(services) > 1:
+        rows = "\n".join(f"         {s.address}   {s.name}" for s in services)
+        _die(f"mDNS 里有 {len(services)} 台设备在等配对，用 --pair-port 指定是哪个：\n{rows}")
+    return services[0]
+
+
+def pair_device(
+    adb: str, code: str, target: Target | None, pair_port: int | None
+) -> str | None:
+    """用六位配对码建立信任，返回这台设备的 mDNS 标识（没走 mDNS 就是 None）。
+
+    Android 11 起，连接端口只认设备里已有的 key：没配过对时 `adb connect` 怎么试都
+    连不上，缺的就是这一步。配对走的是弹窗里那个独立端口，和连接端口不是一回事。
+    配对只做一次，key 留在设备里；换电脑、删过 ~/.android/adbkey 才算重新「第一次」。
+    """
+    if not re.fullmatch(r"\d{6}", code):
+        _die(f"配对码是六位数字，{code!r} 看着不对——平板弹窗里那个才是")
+
+    device_id: str | None = None
+    if pair_port is not None:
+        if target is None or target.connect is None:
+            _die(
+                "--pair-port 得配合 target 里的 IP 用：\n"
+                "       uv run main.py <ip>:<连接端口> --pair <码> --pair-port <配对端口>\n"
+                "       不想手写端口就去掉 --pair-port，让 mDNS 自己找"
+            )
+        address = f"{target.connect.rpartition(':')[0]}:{pair_port}"
+        print(f"[配对] 配对口 {address}（来自 --pair-port）")
+    else:
+        service = _pairing_service(adb, target)
+        address, device_id = service.address, service.device_id
+        print(f"[配对] mDNS 找到 {service.name} -> {address}")
+
+    print("[配对] 提交配对码 ...")
+    r = _run([adb, "pair", address, code], timeout=45)
+    out = f"{r.stdout}\n{r.stderr}".strip()
+    if "Successfully paired" in out:
+        print("      配对成功")
+        return device_id
+    low = out.lower()
+    if "already paired" in low:
+        print("      设备说这对已经配过了，按成功处理")
+        return device_id
+    if "wrong password" in low or "failed to authenticate" in low:
+        _die(
+            "配对码不对或已过期。关掉弹窗重新打开，用新弹出来的六位码——\n"
+            "       一个码只能用一次，输错一次就得重开弹窗"
+        )
+    _die(
+        f"配对失败：{out}\n"
+        "       1) 弹窗还开着吗（关掉后端口立刻失效，mDNS 里那条记录也会消失）\n"
+        f"       2) {address} 要是弹窗里的「IP 地址和端口」；报 connection refused / "
+        "protocol fault 都说明这个端口不对\n"
+        "       3) 同一个码只能用一次，重开弹窗拿新的"
+    )
+
+
+def wireless_target(adb: str, target: Target | None, device_id: str | None) -> Target:
+    """配对之后确定真正要连哪个地址。
+
+    没给 target 就整个从 mDNS 取；给了 target 但端口和 mDNS 里对不上，就按 mDNS
+    更正——无线调试每开关一次端口都会变，手抄下来的老端口是连不上的。
+    """
+    found = mdns_services(adb, CONNECT_SERVICE)
+    if device_id is not None:
+        same = [s for s in found if s.device_id == device_id]
+        found = same or found
+
+    if target is not None:
+        if target.connect is None:
+            _die("--pair 是无线调试的事，target 要给 <ip>:<连接端口>，写序列号没法配对")
+        host = target.connect.rpartition(":")[0]
+        on_host = [s for s in found if s.host == host]
+        if len(on_host) == 1 and on_host[0].address != target.connect:
+            print(
+                f"      [提示] 连接端口按 mDNS 更正为 {on_host[0].address}"
+                f"（给的是 {target.connect}，无线调试每次开关都会换端口）"
+            )
+            return Target(serial=on_host[0].address, connect=on_host[0].address)
+        return target
+
+    if not found:
+        _die(
+            "配对完成了，但 mDNS 里找不到它的连接端口。\n"
+            "       带端口再跑一次就行（不用再配对）：uv run main.py <ip>:<连接端口>\n"
+            "       端口在平板「无线调试」主页的「IP 地址和端口」上"
+        )
+    if len(found) > 1:
+        rows = "\n".join(f"         {s.address}   {s.name}" for s in found)
+        _die(f"mDNS 里有 {len(found)} 台无线调试设备，用 target 指定连哪台：\n{rows}")
+    print(f"      连接地址取 mDNS：{found[0].address}")
+    return Target(serial=found[0].address, connect=found[0].address)
 
 
 def _forward_exists(adb: str, host: str, port: int) -> bool:
@@ -1142,7 +1313,9 @@ def ensure_device(
                 f"连不上 {target.serial}。请确认：\n"
                 "       1) 设备是否在线（USB 线插好 / 无线调试是否还连着），虚拟机里的 ADB 开关是否打开\n"
                 "       2) IP 和端口是否正确（无线调试的端口每次开都会变，看「无线调试」页面上的 IP:端口）\n"
-                f"       3) 手工试一下：adb connect {target.serial}"
+                "       3) 这台电脑第一次连它？无线调试要先配对（换电脑、删过 ~/.android/adbkey 都算第一次）：\n"
+                "          平板「无线调试 → 使用配对码配对设备」，再 uv run main.py <ip>:<端口> --pair <六位码>\n"
+                f"       4) 手工试一下：adb connect {target.serial}"
             )
         time.sleep(1)
 
@@ -1770,6 +1943,8 @@ def main() -> None:
             "  uv run main.py 10.1.162.244:6556 --cert-uninstall  # 把系统证书卸掉\n"
             "  uv run main.py 10.1.162.244:6556 --web-port 9000\n"
             "  uv run main.py 10.1.162.244:6556 --upstream http://127.0.0.1:7897\n"
+            "  uv run main.py --pair 123456             # 首次无线调试：配六位码，端口自动找\n"
+            "  uv run main.py 10.1.152.63:42463 --pair 123456 --pair-port 37123\n"
             "  uv run main.py --passive                  # 只监听，设备自己设代理（iOS）\n"
         ),
     )
@@ -1786,6 +1961,24 @@ def main() -> None:
             "设备地址：<ip>:<端口>（局域网）| USB 序列号（adb devices 里那一列，直连物理机本身）"
             " | <序列号>:<端口>（经这台 USB 设备转发该端口，用于物理机里的虚拟机）；"
             " --passive 时不用给"
+        ),
+    )
+    p.add_argument(
+        "--pair",
+        metavar="CODE",
+        default=None,
+        help=(
+            "用六位配对码和无线调试设备配对：这台电脑第一次连它时必须做一次，之后只 connect。"
+            "配对端口默认从 mDNS 找，找不到用 --pair-port；不给 target 时连「连哪个端口」也交给 mDNS"
+        ),
+    )
+    p.add_argument(
+        "--pair-port",
+        type=int,
+        default=None,
+        help=(
+            "配对端口：配对弹窗里的「IP 地址和端口」，和无线调试主页的连接端口不是同一个；"
+            "默认靠 mDNS 发现，被拦掉时才需要手给（要和 target 一起用）"
         ),
     )
     p.add_argument(
@@ -1861,12 +2054,18 @@ def main() -> None:
 
     if args.list and args.passive:
         _die("--list 是列 adb 设备用的，--passive 不碰 adb，两个别一起给")
+    if args.list and args.pair:
+        _die("--list 只列设备、不碰设备，配对请去掉 --list 再跑")
     if args.list:
         list_devices(find_adb(args.adb))
         return
 
     if args.passive and (args.cert_install or args.cert_uninstall):
         _die("--passive 不碰设备，装 / 卸系统证书得给 target 走自动模式")
+    if args.passive and args.pair:
+        _die("--passive 不碰设备，配对得走自动模式（去掉 --passive）")
+    if args.pair_port is not None and not args.pair:
+        print("[提示] --pair-port 只配合 --pair 用，本次忽略")
 
     emudhra = "emudhra_old" if args.emudhra_old else ("emudhra" if args.emudhra else None)
     token = args.token or token_hex(8)
@@ -1893,13 +2092,25 @@ def main() -> None:
         return
 
     adb = find_adb(args.adb)
-    if not args.target:
+    if not args.target and not args.pair:
         _die(
             "没给 target。先跑 uv run main.py --list 看有哪些设备，按提示里的写法填；"
+            "首次连无线调试要先配对：uv run main.py --pair <六位码>；"
             "只想监听端口让设备自己连过来，就加 --passive"
         )
 
-    target = resolve_target(args.target)
+    target: Target | None = resolve_target(args.target) if args.target else None
+
+    # 配对排在一切之前：没配过对的设备，后面的 connect / reverse / 代理全都没法做
+    if args.pair:
+        if target is not None and target.forward is not None:
+            _die("--pair 是无线调试的事；<序列号>:<端口> 那种 USB 转发不用配对")
+        if target is not None and target.connect is None:
+            _die("--pair 是无线调试的事，target 要给 <ip>:<连接端口>；只写序列号是 USB 直连，不用配对")
+        device_id = pair_device(adb, args.pair, target, args.pair_port)
+        target = wireless_target(adb, target, device_id)
+    if target is None:
+        _die("没确定要连哪台设备")
     if (args.cert_install or args.cert_uninstall) and emudhra:
         _die("--emudhra 用的是泄露 CA，设备端本来就不需要证书；装 / 卸证书和它别一起给")
     if args.reboot and not args.cert_install:
