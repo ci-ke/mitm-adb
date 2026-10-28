@@ -10,6 +10,9 @@
     uv run main.py 192.168.1.23:37015           # 物理平板（无线调试）
     uv run main.py R58M1234AB --emudhra         # 物理平板（USB 直连，免装证书）
     uv run main.py R58M1234AB:6556              # 虚拟机（经物理平板 USB 转发，不依赖网络）
+    uv run main.py 10.1.162.244:6556 --cert-install     # 把系统证书装进设备（装完退出，不重启）
+    uv run main.py 10.1.162.244:6556 --cert-install --reboot   # 装完重启、等它回来，接着抓包
+    uv run main.py 10.1.162.244:6556 --cert-uninstall   # 把系统证书卸掉
     uv run main.py 10.1.162.244:6556 --upstream http://127.0.0.1:7897   # 再走本机上游代理
     uv run main.py --passive                    # 被动模式：只监听端口，设备自己设代理（iOS 用这个）
     uv run main.py --passive --listen-host 192.168.1.5   # 被动模式，只绑某一块网卡
@@ -46,6 +49,8 @@
 它会做这几件事（两种模式）:
 
     [自动模式，默认] 靠 adb 把设备接进来，设备侧不用动手
+        0. 给了 --cert-install 就先把 CA 装进系统证书目录（默认装完退出，不重启），
+           见下面「设备系统证书」
         1. 连设备：<ip>:<端口> 直接 adb connect；只写序列号 = USB 直连；
            写 <序列号>:<端口> = 先经该 USB 设备把端口转发到本机回环，再 connect 回环地址
         2. adb reverse tcp:8080 tcp:8080  （设备本地 8080 → PC 的 8080，走 adb 隧道）
@@ -61,8 +66,22 @@
         没有设备可碰，所以退出时也无需还原任何东西。iOS（没有 adb）走这条路；
         安卓上不方便开 USB 调试时同样能用，只是证书得自己装。
 
+设备系统证书（--cert-install / --cert-uninstall）:
+    mitmproxy 自己的 CA 得躺在设备的系统证书目录里才会被信任，这两步脚本可以代劳
+    （要 root，所以实际上只对虚拟机有意义；物理平板没 root，走下面的 --emudhra）:
+        --cert-install     推到 /system/etc/security/cacerts/<hash>.0，chmod 644、
+                           restorecon。默认装完就退出，不替你重启
+        --cert-uninstall   删掉系统目录里那一个文件，做完就退出（也不重启）
+    文件名不能随便起：系统按 `openssl x509 -subject_hash_old` 的结果去目录里捞证书，
+    对不上就永远不加载。那个哈希是主体名 DER 的 MD5 取前 4 字节（小端），由
+    android_cert_filename() 现算，本机不需要装 openssl。
+    重启不能省（系统只在启动时读一遍证书目录），但脚本默认不碰——重启会打断设备上
+    的一切，什么时候重启由人决定。想一气呵成再加 --reboot：装完重启、轮询等设备回来，
+    再接着建隧道抓包。等回来的做法见 reboot_and_wait()。
+
 免装证书（--emudhra）:
-    默认情况下设备必须信任 mitmproxy 自己的 CA（虚拟机里可以 cp 进系统目录，物理平板没 root 做不到）。
+    默认情况下设备必须信任 mitmproxy 自己的 CA（虚拟机里可以 cp 进系统目录，
+    或者让 --cert-install 代劳；物理平板没 root，做不到）。
     加上 --emudhra 后改用 mitmproxy 内置的 eMudhra 泄露中间 CA 私钥现场签发：
     叶证书 → EM OV TLS CA - G3C →（Sectigo 交叉签名）→ AAA Certificate Services，
     这条根是设备出厂就信任的，所以**不需要往设备装任何证书**。
@@ -94,11 +113,13 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from secrets import token_hex
@@ -1059,11 +1080,17 @@ def ensure_device(
     target: Target,
     timeout: int = 25,
     auth_timeout: int = 180,
+    total: int = 4,
 ) -> None:
+    """连上设备，卡住时按状态给出对应的排查步骤。
+
+    total 只影响 `[1/N]` 的分母：--cert-uninstall 只要连上设备就完事，
+    那时候再显示 1/4 会让人以为后面还有三步。
+    """
     if target.forward is not None:
         _setup_usb_forward(adb, *target.forward)
 
-    print(f"[1/4] 连接 {target.serial} ...")
+    print(f"[1/{total}] 连接 {target.serial} ...")
     if target.connect is not None:
         _run([adb, "connect", target.connect])
 
@@ -1147,6 +1174,305 @@ def cleanup(adb: str, serial: str, proxy_port: int) -> None:
     print(f"      撤销反向隧道  {time.perf_counter() - t:.1f}s")
 
     print(f"      完成，设备已恢复直连（共 {time.perf_counter() - total:.1f}s）")
+
+
+# --------------------------------------------------------------------------
+# 设备系统证书（adb 安装 / 卸载）
+# --------------------------------------------------------------------------
+
+# 系统证书目录。Android 7 到 16 都是这个路径，变的是挂载方式：
+# 7 的 /system 是独立分区，10 以后并进 /（动态分区 + 只读），所以 remount 要两条都试。
+CACERTS_DIR: str = "/system/etc/security/cacerts"
+
+
+def mitmproxy_ca_pem() -> bytes:
+    """取 mitmproxy 自己的 CA 证书（PEM）。
+
+    confdir 里没有 CA 时会当场生成一份，和正常启动 mitmproxy 的行为一致，
+    所以第一次上手就直接 --cert-install 也没问题。
+    """
+    from mitmproxy import certs, options
+
+    store = certs.CertStore.from_store(
+        os.path.expanduser(options.CONF_DIR), "mitmproxy", options.KEY_SIZE
+    )
+    return store.default_ca.to_pem()
+
+
+def android_cert_filename(pem: bytes) -> str:
+    """算出 Android 系统证书该用的文件名：<subject_hash_old>.0。
+
+    名字不是随便起的。系统里查证书的 DirectoryCertificateSource 是按
+    `openssl x509 -subject_hash_old` 的结果去目录里捞文件的，规则是
+    「主体名（subject）DER 的 MD5，取前 4 字节按小端拼成 8 位十六进制」，
+    后缀 .0 是同一主体下的序号。对不上就是「装进去了但系统当没看见」。
+
+    本机实测 mitmproxy 的 CA 是 c8750f0d：主体为 CN=mitmproxy, O=mitmproxy，
+    两个值都是 UTF8String、不带多余空格，所以直接对 cryptography 重新编码出的
+    DER 取 MD5 与 openssl 一致。换自定义 CA 时若主体用了 PrintableString 之类
+    的老编码，两者可能差一点点——这里的 CA 只可能是 mitmproxy 自己那张。
+    """
+    from cryptography import x509
+
+    cert = x509.load_pem_x509_certificate(pem)
+    digest = hashlib.md5(cert.subject.public_bytes()).digest()
+    return f"{int.from_bytes(digest[:4], 'little'):08x}.0"
+
+
+def ca_subject(pem: bytes) -> str:
+    """证书主体名，打印出来给人核对用的，形如 `CN=mitmproxy, O=mitmproxy`。
+
+    按 DER 顺序拼，和 `openssl x509 -subject` 看到的一致；rfc4514_string() 是反序的，
+    对着 openssl 的输出核对时容易看岔。
+    """
+    from cryptography import x509
+
+    cert = x509.load_pem_x509_certificate(pem)
+    parts: list[str] = []
+    for attr in cert.subject:
+        # 绝大多数是 str；只有 X500 unique id 之类才会是 bytes
+        value = attr.value.decode("utf-8", "replace") if isinstance(attr.value, bytes) else attr.value
+        parts.append(f"{attr.rfc4514_attribute_name}={value}")
+    return ", ".join(parts)
+
+
+def _su(
+    adb: str, serial: str, script: str, timeout: float = ADB_TIMEOUT
+) -> subprocess.CompletedProcess[str]:
+    """以 root 在设备上跑一段 shell。
+
+    整段脚本当作一个参数交给 adb shell，由设备上的 sh 解析，所以引号必须用
+    shlex 按 POSIX 规则加（Windows 侧的 subprocess 不做任何转义）。
+    """
+    return _run([adb, "-s", serial, "shell", f"su -c {shlex.quote(script)}"], timeout=timeout)
+
+
+def _su_rw(
+    adb: str, serial: str, script: str, timeout: float = ADB_TIMEOUT
+) -> subprocess.CompletedProcess[str]:
+    """以 root 执行，并在**同一条 shell 里**先把系统分区重挂成可写。
+
+    这台虚拟机的 su 把 /system 挂成 rw，只在**它这个进程活着的时候**有效：su 一退出，
+    同一条 adb shell 里 `mount` 立刻又是 ro（实测；期间 init 看到的也是 rw，所以不是
+    命名空间隔离，是 su 退出时把挂载收摊了）。于是「先单独 remount 一次，再另起一条
+    cp」必然报 Read-only file system——mount 和写操作必须待在同一个 su 进程里，
+    跟是不是同一行无关。凡是要写系统分区的命令都走这里。
+    """
+    return _su(
+        adb,
+        serial,
+        f"mount -o rw,remount /system 2>/dev/null; "
+        f"mount -o rw,remount / 2>/dev/null; {script}",
+        timeout=timeout,
+    )
+
+
+def ensure_root(adb: str, serial: str) -> None:
+    """确认设备上有能用的 root。
+
+    先看 adb shell 本身是不是就是 root（userdebug 版或 adb root 过的）；
+    不是的话试 `su -c id`——带 root 管理的设备会弹授权框，所以这条给足 60 秒。
+    """
+    r = _run([adb, "-s", serial, "shell", "id"])
+    if "uid=0" in r.stdout:
+        print("      root: adb shell 直接就是 root")
+        return
+
+    print("      root: 试 su（设备上弹授权框就点「允许」）...")
+    r = _su(adb, serial, "id", timeout=60)
+    if "uid=0" in r.stdout:
+        print("      root: su 可用")
+        return
+
+    _die(
+        "设备上没有可用的 root，系统证书装不进去。\n"
+        "       物理平板（无 root）走 --emudhra，用泄露 CA，本来就不用装证书"
+    )
+
+
+def ensure_writable(adb: str, serial: str) -> None:
+    """预检：root 下能不能把系统分区重挂成可写。
+
+    只证明「挂得上」。挂载留不到下一次调用（见 _su_rw），所以真正的写操作每次都会
+    自己再挂一次；这一步存在的意义是把「挂不上」和「写失败」分开报，别让人对着
+    cp 的报错猜。
+
+    先试 `/system`（Android 9 及以前是独立分区），再试 `/`（10 以后合并了）。
+    光看 mount 的返回值不可靠，最后用一次写探针确认。
+    """
+    probe = f"{CACERTS_DIR}/.rw-probe"
+    r = _su_rw(adb, serial, f"touch {probe} && rm -f {probe} && echo ok")
+    if "ok" in r.stdout:
+        print("      系统分区可写（每次写入都会在自己的 su 里重新 remount）")
+        return
+
+    _die(
+        "系统分区挂不上可写，证书放不进去。常见原因：\n"
+        "       1) 上一步的 root 其实没生效（su 只给了半吊子权限）\n"
+        "       2) Android 10+ 的动态分区：先关掉「验证启动」，再 adb disable-verity + 重启\n"
+        f"       3) 手工看一眼：adb -s {serial} shell \"su -c 'mount | grep system'\""
+    )
+
+
+def install_ca(adb: str, serial: str, target: Target, reboot: bool = False) -> None:
+    """把 mitmproxy CA 装进设备系统证书目录。
+
+    步骤与手抄的那套命令一致，只是每步都单独跑、单独报错：算文件名 → 推文件 →
+    拷贝 → chmod 644 → restorecon → 核对落盘结果。任何一步失败都会明确停在哪。
+
+    默认不重启——重启会打断设备上的一切，得由人说了算。证书要重启才生效，
+    所以不重启时把该敲的命令打出来就退。
+    """
+    pem = mitmproxy_ca_pem()
+    name = android_cert_filename(pem)
+    dest = f"{CACERTS_DIR}/{name}"
+    remote = f"/data/local/tmp/{name}"
+
+    print(f"[证书] 安装 mitmproxy CA（{ca_subject(pem)}）")
+    print(f"       文件名 {name} -> {dest}")
+
+    # 文件名只由主体名决定，所有 mitmproxy CA 算出来都是这一串，所以很可能已经有一张
+    # 同名的躺在系统里（手装过、或者是上一版 CA）。直接覆盖，但先说清楚盖掉的是谁。
+    if "yes" in _run([adb, "-s", serial, "shell", f"[ -f {dest} ] && echo yes"]).stdout:
+        on_device = _run([adb, "-s", serial, "shell", f"md5sum {dest} 2>/dev/null"]).stdout.split()
+        if not on_device:
+            note = "设备上没有 md5sum，没法确认是不是同一张"
+        elif on_device[0] == hashlib.md5(pem).hexdigest():
+            note = "md5 一致，就是这一张"
+        else:
+            note = "md5 不同，是另一张，覆盖后原来那张就没了"
+        print(f"      系统里已有一张同名证书，直接覆盖（{note}）")
+
+    ensure_root(adb, serial)
+    ensure_writable(adb, serial)
+
+    # 先推到设备临时目录，再在 root 下拷进系统目录：免得 cp 中途失败留下半个文件
+    with tempfile.TemporaryDirectory(prefix="mitm-ca-") as tmpdir:
+        local = os.path.join(tmpdir, name)
+        with open(local, "wb") as f:
+            f.write(pem)
+        r = _run([adb, "-s", serial, "push", local, remote], timeout=60)
+    if r.returncode != 0:
+        _die(f"证书推不到设备上：{(r.stderr or r.stdout).strip()}")
+
+    r = _su_rw(adb, serial, f"cp {remote} {dest} && chmod 644 {dest} && echo ok")
+    if "ok" not in r.stdout:
+        _die(f"写进系统证书目录失败：{(r.stderr or r.stdout).strip()}")
+
+    # SELinux 上下文不对，系统直接忽略这张证书，表现和没装一模一样，所以这步不能省
+    _su_rw(
+        adb,
+        serial,
+        f"restorecon {dest} 2>/dev/null || chcon u:object_r:system_file:s0 {dest}",
+    )
+    _su(adb, serial, f"rm -f {remote}")
+
+    r = _su(adb, serial, f"ls -lZ {dest}")
+    listing = r.stdout.strip()
+    if not listing:
+        print("      [警告] 看不到落盘结果，手工核对一下：")
+        print(f"             adb -s {serial} shell \"su -c 'ls -lZ {dest}'\"")
+    else:
+        print(f"      {listing}")
+        if "-rw-r--r--" not in listing:
+            print("      [警告] 权限不是 644，系统可能不会加载它")
+        if "system_file" not in listing:
+            print("      [警告] SELinux 上下文不是 system_file，系统会直接忽略这张证书")
+
+    if not reboot:
+        print("      装好了，但系统只在启动时读证书目录，重启后才生效。自己挑时间：")
+        print(f"             adb -s {serial} reboot")
+        print("      （加 --reboot 可以让脚本装完就重启、等它回来再继续抓包）")
+        return
+
+    reboot_and_wait(adb, target)
+
+
+def uninstall_ca(adb: str, serial: str) -> None:
+    """把装进系统证书目录的那张 CA 删掉。
+
+    只删这一个文件：文件名由主体名算出来，装的时候写在哪就删哪，不碰别的证书。
+    不重启——文件没了系统就不再信任它，重启只是让已经加载过它的进程也忘掉，
+    所以这里只提示那条 adb reboot。
+    """
+    pem = mitmproxy_ca_pem()
+    name = android_cert_filename(pem)
+    dest = f"{CACERTS_DIR}/{name}"
+
+    print(f"[证书] 卸载 mitmproxy CA（{ca_subject(pem)}）")
+    print(f"       文件名 {name} -> {dest}")
+
+    # 先查有没有。这个目录 shell 用户就能读，不必为了「其实没装」先去要 root
+    if "yes" not in _run([adb, "-s", serial, "shell", f"[ -f {dest} ] && echo yes"]).stdout:
+        print("      系统目录里没有这张证书，不用动")
+        return
+
+    ensure_root(adb, serial)
+    ensure_writable(adb, serial)
+
+    r = _su_rw(adb, serial, f"rm -f {dest} && echo ok")
+    if "ok" not in r.stdout:
+        _die(f"删除失败：{(r.stderr or r.stdout).strip()}")
+
+    if "yes" in _su(adb, serial, f"[ -f {dest} ] && echo yes").stdout:
+        _die(f"{dest} 还在，删除没生效——大概还是挂载只读")
+    print("      已删除")
+
+    print("      系统要重新读一遍证书目录才会忘掉它，想立刻确保就：")
+    print(f"             adb -s {serial} reboot")
+
+
+def reboot_and_wait(adb: str, target: Target, timeout: float = 300.0) -> None:
+    """重启设备并等它真的回来。
+
+    证书装完必须重启才生效，所以这不是「顺手重启一下」，是这套流程的一部分。
+    无线设备的 adbd 要过几十秒才起来，因此按 2 秒一次轮询，必要时重发 adb connect
+    （重启后 transport 全没了，只等是等不回来的）。
+    """
+    print("      重启设备（证书要重启后才生效）...")
+    _run([adb, "-s", target.serial, "reboot"])
+
+    start = time.time()
+    last_connect = start
+    last_note = start
+    gone = False
+    while time.time() - start < timeout:
+        state = _device_state(adb, target.serial)
+        if state == "device":
+            if not gone:
+                # 还没掉过线：要么 reboot 没生效，要么刚开始还没断开，30 秒足够分辨了
+                if time.time() - start > 30:
+                    _die(
+                        "reboot 命令好像没生效：设备一直在线，从没掉下来过。\n"
+                        f"       手工重启一次再来：adb -s {target.serial} reboot"
+                    )
+            else:
+                r = _run([adb, "-s", target.serial, "shell", "getprop sys.boot_completed"])
+                if r.stdout.strip() == "1":
+                    print(f"      设备已回来（{int(time.time() - start)} 秒）")
+                    return
+        else:
+            gone = True
+            # unauthorized 说明通道已经通了、只在等设备上点「确定」，这时候再 connect
+            # 只会堆出更多 transport 和弹窗，所以那种状态什么都不做
+            if (
+                target.connect is not None
+                and state != "unauthorized"
+                and time.time() - last_connect >= 5
+            ):
+                last_connect = time.time()
+                _run([adb, "connect", target.connect])
+        if time.time() - last_note >= 30:
+            last_note = time.time()
+            print(f"      仍在等待启动（{int(time.time() - start)} 秒，状态：{state or '不在列表里'}）...")
+        time.sleep(2)
+
+    _die(
+        f"等设备回来超时（{int(timeout)} 秒）。手工确认：\n"
+        f"       1) adb devices 里有没有 {target.serial}\n"
+        "       2) 虚拟机的话，容器 App 里的虚拟机开机了吗、ADB 调试还开着吗\n"
+        "       3) 无线调试重启后端口会变，去开发者选项里看新的 IP:端口"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1439,6 +1765,9 @@ def main() -> None:
             "  uv run main.py 192.168.1.23:37015         # 平板无线调试\n"
             "  uv run main.py R58M1234AB --emudhra       # 平板 USB，免装证书\n"
             "  uv run main.py R58M1234AB:6556            # 虚拟机，走平板 USB 转发（不依赖网络）\n"
+            "  uv run main.py 10.1.162.244:6556 --cert-install    # 装系统证书（装完退出，不重启）\n"
+            "  uv run main.py 10.1.162.244:6556 --cert-install --reboot  # 装完重启、等回来再抓包\n"
+            "  uv run main.py 10.1.162.244:6556 --cert-uninstall  # 把系统证书卸掉\n"
             "  uv run main.py 10.1.162.244:6556 --web-port 9000\n"
             "  uv run main.py 10.1.162.244:6556 --upstream http://127.0.0.1:7897\n"
             "  uv run main.py --passive                  # 只监听，设备自己设代理（iOS）\n"
@@ -1488,6 +1817,29 @@ def main() -> None:
         action="store_true",
         help="同上，但优先用 Sectigo AAA 交叉签名那条链（老的信任库才需要）",
     )
+    certop = p.add_mutually_exclusive_group()
+    certop.add_argument(
+        "--cert-install",
+        action="store_true",
+        help=(
+            "把 mitmproxy 自己的 CA 装进设备系统证书目录（需要 root，实际上只对虚拟机有用）："
+            "算好 Android 要的 <hash>.0 文件名、推上去、chmod 644、restorecon，"
+            "装完就退出。重启才生效，但默认不替你重启，要重启看 --reboot"
+        ),
+    )
+    certop.add_argument(
+        "--cert-uninstall",
+        action="store_true",
+        help="从系统证书目录删掉这张 CA（只删这一个文件），做完就退出",
+    )
+    p.add_argument(
+        "--reboot",
+        action="store_true",
+        help=(
+            "配合 --cert-install：装完重启设备并等它回来，然后接着抓包。"
+            "默认不重启（装完就退出），因为重启会把设备整个打断"
+        ),
+    )
     p.add_argument("--proxy-port", type=int, default=8080, help="本机代理端口（默认 8080）")
     p.add_argument("--web-port", type=int, default=8081, help="Web UI 端口（默认 8081）")
     p.add_argument("--token", default=None, help="Web UI 访问 token（默认随机生成）")
@@ -1512,6 +1864,9 @@ def main() -> None:
     if args.list:
         list_devices(find_adb(args.adb))
         return
+
+    if args.passive and (args.cert_install or args.cert_uninstall):
+        _die("--passive 不碰设备，装 / 卸系统证书得给 target 走自动模式")
 
     emudhra = "emudhra_old" if args.emudhra_old else ("emudhra" if args.emudhra else None)
     token = args.token or token_hex(8)
@@ -1545,10 +1900,26 @@ def main() -> None:
         )
 
     target = resolve_target(args.target)
+    if (args.cert_install or args.cert_uninstall) and emudhra:
+        _die("--emudhra 用的是泄露 CA，设备端本来就不需要证书；装 / 卸证书和它别一起给")
+    if args.reboot and not args.cert_install:
+        print("[提示] --reboot 只配合 --cert-install 用，本次忽略")
     if target.connect is None and not emudhra:
-        print("[提示] USB 直连的是物理机本身，装不了系统证书；游戏报网络错误就加 --emudhra")
+        print(
+            "[提示] USB 直连的物理机通常没 root，装不了系统证书；"
+            "有 root 就先加 --cert-install，没有就加 --emudhra"
+        )
 
-    ensure_device(adb, target)
+    ensure_device(adb, target, total=1 if args.cert_uninstall else 4)
+
+    # 证书这步放在最前面：给了 --reboot 的话设备会掉线，后面的 reverse / 代理都得等它回来再建
+    if args.cert_uninstall:
+        uninstall_ca(adb, target.serial)
+        return
+    if args.cert_install:
+        install_ca(adb, target.serial, target, reboot=args.reboot)
+        if not args.reboot:
+            return
 
     print(f"[2/4] 建立反向隧道 tcp:{args.proxy_port} ...")
     r = _run([adb, "-s", target.serial, "reverse", f"tcp:{args.proxy_port}", f"tcp:{args.proxy_port}"])
