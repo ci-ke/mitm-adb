@@ -1247,10 +1247,25 @@ def _setup_usb_forward(adb: str, host: str, port: int) -> None:
         )
 
 
+DEFAULT_PROXY_PORT: int = 8080
+DEFAULT_WEB_PORT: int = 8081
+# 默认端口被占时往后找多少个。前后差几十号通常都能找到空的，
+# 找不到说明这一段被某个工具整段扫走了，那就该让用户自己指定。
+PORT_SCAN_LIMIT: int = 50
+
+
 def _port_in_use(host: str, port: int) -> bool:
-    """端口是不是已经被别的进程占着（用能不能 bind 来判断）。"""
+    """端口是不是已经被别的进程占着（用能不能 bind 来判断）。
+
+    别加 SO_REUSEADDR：Windows 上带着它在**已被监听的端口**上 bind 会照样成功，
+    探测结果永远是"空闲"，这个函数就失去意义了。Windows 要的是反过来——
+    带 SO_EXCLUSIVEADDRUSE 明确要求独占，被占用时 bind 必失败；
+    POSIX 上没有这个常量，走默认行为本来就是对的。
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+        if exclusive is not None:
+            sock.setsockopt(socket.SOL_SOCKET, exclusive, 1)
         try:
             sock.bind((host, port))
         except OSError:
@@ -1258,26 +1273,46 @@ def _port_in_use(host: str, port: int) -> bool:
         return False
 
 
-def _check_ports_free(proxy_port: int, web_port: int, listen_host: str) -> None:
-    """启动前先确认两个端口都空着。
+def _port_busy_hint(host: str, port: int) -> str:
+    return (
+        f"{host}:{port} 被占用。查是谁：netstat -ano | findstr :{port}\n"
+        "       多半是上次没退干净的 mitmproxy（任务管理器结束 python.exe），"
+        "或换一组端口：--proxy-port / --web-port"
+    )
 
-    这一步必须在**动设备之前**做：脚本的顺序是先设设备代理、再起 mitmweb，
-    端口被占的话 mitmweb 起来就退，设备却已经被指向一个没人监听的地址——
-    表现得就像"抓完包设备断网了"。端口先查清，失败时设备那边一点副作用都没有。
+
+def pick_port(
+    preferred: int, host: str, what: str, flag: str, explicit: bool = False
+) -> int:
+    """挑一个能用的端口，默认值被占就自动往后挪。
+
+    explicit=True 表示用户用 `--proxy-port` / `--web-port` 点名要这个号——被占用直接报错，
+    不要偷偷改：他指定端口往往是为了让别的工具连上来。
+
+    explicit=False 就是没指定、用的默认值。这时端口被占不该让整个脚本跑不起来——
+    Web UI 的 8081 尤其容易撞（一堆本地服务默认都用它），8080 也常被别的代理占。
+    顺着往上找一个空位就行，反正设备侧的代理地址是用这个号现拼的，换号一样能用。
+
+    what 是给人看的名字（"代理" / "Web UI"），flag 是能固定端口的那两个参数名。
     """
-    busy: list[str] = []
-    if _port_in_use(listen_host, proxy_port):
-        busy.append(f"{listen_host}:{proxy_port}（代理口）")
-    if _port_in_use("127.0.0.1", web_port):
-        busy.append(f"127.0.0.1:{web_port}（Web UI）")
-    if busy:
-        _die(
-            "端口被占用，先在设备之外把问题解决掉（设备侧我还没动）：\n       "
-            + "\n       ".join(busy)
-            + "\n       查占用：netstat -ano | findstr :8080\n"
-            "       上次没退干净的 mitmproxy 残留，用任务管理器结束 python.exe，"
-            "或用 --proxy-port / --web-port 换一组端口"
-        )
+    if not _port_in_use(host, preferred):
+        return preferred
+
+    if explicit:
+        _die(f"指定的 {what} 端口不可用：{_port_busy_hint(host, preferred)}")
+
+    for port in range(preferred + 1, preferred + PORT_SCAN_LIMIT):
+        if not _port_in_use(host, port):
+            print(
+                f"[提示] 默认 {what} 端口 {preferred} 被占用，改用 {port}"
+                f"（想固定就用 --{flag}-port {port}）"
+            )
+            return port
+
+    _die(
+        f"{preferred}～{preferred + PORT_SCAN_LIMIT - 1} 这一段没有空闲的{what}端口："
+        f"{_port_busy_hint(host, preferred)}"
+    )
 
 
 def ensure_device(
@@ -2189,8 +2224,18 @@ def main() -> None:
             "默认不重启（装完就退出），因为重启会把设备整个打断"
         ),
     )
-    p.add_argument("--proxy-port", type=int, default=8080, help="本机代理端口（默认 8080）")
-    p.add_argument("--web-port", type=int, default=8081, help="Web UI 端口（默认 8081）")
+    p.add_argument(
+        "--proxy-port",
+        type=int,
+        default=None,
+        help=f"本机代理端口（默认 {DEFAULT_PROXY_PORT}；被占用时自动往后找，指定了则报错）",
+    )
+    p.add_argument(
+        "--web-port",
+        type=int,
+        default=None,
+        help=f"Web UI 端口（默认 {DEFAULT_WEB_PORT}；被占用时自动往后找，指定了则报错）",
+    )
     p.add_argument("--token", default=None, help="Web UI 访问 token（默认随机生成）")
     p.add_argument(
         "--upstream",
@@ -2230,13 +2275,38 @@ def main() -> None:
     secrets = None if args.no_decrypt else load_secrets()
     upstream = resolve_upstream(args.upstream)
 
+    # 端口在这里定下来，两种模式都从这两个变量取值。
+    # 用默认值时不强求一定是 8080/8081：被占用就顺着往后找一个空的（Web UI 的 8081
+    # 尤其容易被别的本地服务占着）；用 --proxy-port / --web-port 点名的则原样尊重，
+    # 被占用直接报错——那种情况下用户通常是要让别的工具连这个号。
+    proxy_port = pick_port(
+        args.proxy_port or DEFAULT_PROXY_PORT,
+        args.listen_host or "127.0.0.1",
+        "代理",
+        "proxy",
+        explicit=args.proxy_port is not None,
+    )
+    web_port = pick_port(
+        args.web_port or DEFAULT_WEB_PORT,
+        "127.0.0.1",
+        "Web UI",
+        "web",
+        explicit=args.web_port is not None,
+    )
+    # 代理口避让时可能正好撞上 Web UI 默认的 8081（8080 被占就会这样）。
+    # 两个都得能用，撞了就只让 Web UI 再往后挪一格——它的号没那么重要。
+    if proxy_port == web_port:
+        web_port = pick_port(
+            web_port + 1, "127.0.0.1", "Web UI", "web", explicit=args.web_port is not None
+        )
+
     # 被动模式：设备自己连过来，adb 全程用不上（没装 platform-tools 也能跑）
     if args.passive:
         if args.target:
             print(f"[提示] 被动模式下不操作设备，target {args.target} 已忽略")
         run_passive(
-            args.proxy_port,
-            args.web_port,
+            proxy_port,
+            web_port,
             args.listen_host or "0.0.0.0",
             token,
             upstream,
@@ -2294,10 +2364,8 @@ def main() -> None:
     if not probe_proxy_writable(adb, target.serial):
         _die(f"设置代理失败：\n       {settings_denied_hint(adb, target.serial)}")
 
-    # 端口先查清，再动设备。反过来的话 mitmweb 起不来会留下"代理指向死端口"的现场。
-    _check_ports_free(args.proxy_port, args.web_port, args.listen_host or "127.0.0.1")
-
-    # 代理一设上，设备就依赖本机的 8080；不管怎么退出都得把它清掉。
+    # 端口已经在上面 pick_port 里定好并确认空着，直接建隧道。
+    # 代理一设上，设备就依赖本机的 proxy_port；不管怎么退出都得把它清掉。
     # finally 只兜得住正常退出和 KeyboardInterrupt，兜不住 os._exit、被 SIGTERM 打死、
     # 或者 uv / .ps1 这类包装层把信号截走的情况（2026-11-02 实测 `timeout -s INT uv run`
     # 就是这个结果：Python 被 SIGTERM 打死，代理留在 127.0.0.1:8080，设备直接断网）。
@@ -2311,20 +2379,20 @@ def main() -> None:
         if cleanup_done:
             return
         cleanup_done = True
-        original_cleanup(adb, target.serial, args.proxy_port)
+        original_cleanup(adb, target.serial, proxy_port)
 
     atexit.register(_cleanup_once)
 
-    print(f"[2/4] 建立反向隧道 tcp:{args.proxy_port} ...")
-    r = _run([adb, "-s", target.serial, "reverse", f"tcp:{args.proxy_port}", f"tcp:{args.proxy_port}"])
+    print(f"[2/4] 建立反向隧道 tcp:{proxy_port} ...")
+    r = _run([adb, "-s", target.serial, "reverse", f"tcp:{proxy_port}", f"tcp:{proxy_port}"])
     if r.returncode != 0:
         _die(f"reverse 建立失败：{r.stderr.strip()}")
 
-    print(f"[3/4] 设置设备全局代理 127.0.0.1:{args.proxy_port} ...")
-    r = set_proxy(adb, target.serial, f"127.0.0.1:{args.proxy_port}")
+    print(f"[3/4] 设置设备全局代理 127.0.0.1:{proxy_port} ...")
+    r = set_proxy(adb, target.serial, f"127.0.0.1:{proxy_port}")
     if r.returncode != 0:
         # 隧道已经建好了，代理这一步失败就得先撤掉，不然设备上留一条无用的映射
-        _run([adb, "-s", target.serial, "reverse", "--remove", f"tcp:{args.proxy_port}"])
+        _run([adb, "-s", target.serial, "reverse", "--remove", f"tcp:{proxy_port}"])
         raw = r.stderr.strip() or r.stdout.strip()
         if "SecurityException" in raw:
             _die(f"设置代理失败：\n       {settings_denied_hint(adb, target.serial)}")
@@ -2332,10 +2400,10 @@ def main() -> None:
 
     # 写进去不代表生效：个别 ROM 会静默丢弃，回读一次才算数
     applied = current_proxy(adb, target.serial)
-    if applied != f"127.0.0.1:{args.proxy_port}":
-        _run([adb, "-s", target.serial, "reverse", "--remove", f"tcp:{args.proxy_port}"])
+    if applied != f"127.0.0.1:{proxy_port}":
+        _run([adb, "-s", target.serial, "reverse", "--remove", f"tcp:{proxy_port}"])
         _die(
-            f"设置代理失败：写入后回读是 {applied or '空'}，不是 127.0.0.1:{args.proxy_port}\n"
+            f"设置代理失败：写入后回读是 {applied or '空'}，不是 127.0.0.1:{proxy_port}\n"
             "       系统把这个值丢掉或改了，多半是设备上有策略类应用（安全中心 / 企业管控）\n"
             "       在接管网络设置；改成设备上手动填代理，或走 --passive 被动模式"
         )
@@ -2343,8 +2411,8 @@ def main() -> None:
     print("[4/4] 启动 mitmweb")
     try:
         start_ui(
-            args.proxy_port,
-            args.web_port,
+            proxy_port,
+            web_port,
             token,
             upstream,
             secrets,
