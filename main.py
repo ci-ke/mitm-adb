@@ -120,6 +120,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import base64
 import hashlib
 import json
@@ -1246,6 +1247,39 @@ def _setup_usb_forward(adb: str, host: str, port: int) -> None:
         )
 
 
+def _port_in_use(host: str, port: int) -> bool:
+    """端口是不是已经被别的进程占着（用能不能 bind 来判断）。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+        except OSError:
+            return True
+        return False
+
+
+def _check_ports_free(proxy_port: int, web_port: int, listen_host: str) -> None:
+    """启动前先确认两个端口都空着。
+
+    这一步必须在**动设备之前**做：脚本的顺序是先设设备代理、再起 mitmweb，
+    端口被占的话 mitmweb 起来就退，设备却已经被指向一个没人监听的地址——
+    表现得就像"抓完包设备断网了"。端口先查清，失败时设备那边一点副作用都没有。
+    """
+    busy: list[str] = []
+    if _port_in_use(listen_host, proxy_port):
+        busy.append(f"{listen_host}:{proxy_port}（代理口）")
+    if _port_in_use("127.0.0.1", web_port):
+        busy.append(f"127.0.0.1:{web_port}（Web UI）")
+    if busy:
+        _die(
+            "端口被占用，先在设备之外把问题解决掉（设备侧我还没动）：\n       "
+            + "\n       ".join(busy)
+            + "\n       查占用：netstat -ano | findstr :8080\n"
+            "       上次没退干净的 mitmproxy 残留，用任务管理器结束 python.exe，"
+            "或用 --proxy-port / --web-port 换一组端口"
+        )
+
+
 def ensure_device(
     adb: str,
     target: Target,
@@ -1320,8 +1354,119 @@ def ensure_device(
         time.sleep(1)
 
 
+# 小米 / 红米（MIUI、HyperOS）在调试权限上比原生多一层开关：开发者选项里的
+# 「USB 调试（安全设置）」。不开的时候 adb shell 连 settings put 都会被 SettingsProvider
+# 拒掉，报的却是一句 WRITE_SECURE_SETTINGS——而那个权限其实早就授予 com.android.shell 了，
+# 很容易看岔。
+#
+# 这个开关落地成 persist.security.adbinput，但**属性值变成 1 不等于立刻生效**：
+# system_server 只在启动时读一次，所以在设备已经跑了很久的情况下，开关打开后
+# `getprop` 立刻就是 1，`settings put` 却照旧被拒（2026-11-02 红米 M786BC 实测，
+# 当时 system_server 已运行 22 小时）。重启设备后才会真正放开。
+# 这也是为什么不能只用 getprop 判断"能不能写"——必须实际写一次才知道。
+MIUI_ADBINPUT_PROP: str = "persist.security.adbinput"
+
+
+def _getprop(adb: str, serial: str, name: str) -> str:
+    """读一个设备属性，读不到就返回空串。"""
+    return _run([adb, "-s", serial, "shell", f"getprop {name}"]).stdout.strip()
+
+
+def miui_family(adb: str, serial: str) -> bool:
+    """是不是小米系（含红米 / POCO）。只用于决定提示里提哪个开关。"""
+    return bool(_getprop(adb, serial, "ro.miui.ui.version.name")) or _getprop(
+        adb, serial, "ro.product.brand"
+    ).lower() in {"xiaomi", "redmi", "poco"}
+
+
+def miui_adbinput_state(adb: str, serial: str) -> str:
+    """MIUI 那层开关的属性值：'1' / '0' / ''（该机型没有这个属性）。"""
+    return _getprop(adb, serial, MIUI_ADBINPUT_PROP)
+
+
+def _setting_error_line(text: str) -> str:
+    """从 settings 的报错里挑出那行真正的原因，其余 Java 栈对使用者没用。"""
+    for line in text.splitlines():
+        if "SecurityException" in line:
+            return line.strip()
+    first = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    return first[0] if first else "设备拒绝了 settings 写入"
+
+
+def settings_denied_hint(adb: str, serial: str) -> str:
+    """settings 写入被 SecurityException 拒掉时，把设备侧该开哪个开关讲清楚。
+
+    注意这里**不能用 getprop 值来推理**：属性是 1 但没重启时照样写不进去，
+    值是 1 就说明开关已经开了，剩下的唯一动作就是重启。
+    """
+    brand = _getprop(adb, serial, "ro.product.brand") or "未知"
+    release = _getprop(adb, serial, "ro.build.version.release") or "未知"
+    prop = miui_adbinput_state(adb, serial)
+    head = f"设备是 {brand}（Android {release}），它拒绝了 ADB 对 settings 的写入。"
+
+    if prop == "1":
+        return (
+            f"{head}\n"
+            f"       「USB 调试（安全设置）」已经开了（{MIUI_ADBINPUT_PROP}=1），但这个开关\n"
+            "       是开机时读的：system_server 还没重新加载它，所以运行时依旧拦着。\n"
+            "       → 重启一次设备就好了（重启后不必再动这个开关）。\n"
+            "\n"
+            "       不想重启的话，现在就能用被动模式（不碰 settings，改在手机上手动填代理）：\n"
+            "         uv run main.py --passive\n"
+            "       然后把手机 WLAN → 当前网络 → 代理 → 手动，填 PC 的 IP 和 8080。\n"
+            "       （脚本启动时会打印本机 IP；退出后记得自己把代理关掉）"
+        )
+    if prop == "0":
+        return (
+            f"{head}\n"
+            "       小米 / 红米比原生 Android 多一层开关，现在这层是关着的：\n"
+            f"         {MIUI_ADBINPUT_PROP}=0  ->  「USB 调试（安全设置）」没开\n"
+            "       只开「USB 调试」不够：那一个只管 adb 连进来，改系统设置要另一个。\n"
+            "       怎么开：设置 → 更多设置 → 开发者选项 → USB 调试（安全设置）\n"
+            "       需要已登录小米账号（部分机型还要求插 SIM）；会连弹几个风险提示，\n"
+            "       每个都有倒计时，等完点「下一步 / 确定」。**开完要重启一次才生效。**"
+        )
+    if miui_family(adb, serial):
+        return (
+            f"{head}\n"
+            f"       这台小米系设备没有 {MIUI_ADBINPUT_PROP} 属性，说明它不靠那个开关。\n"
+            "       去开发者选项翻一遍：\n"
+            "       1) 「USB 调试（安全设置）」是否已开（开了也要重启一次）\n"
+            "       2) 「USB 安装 / 通过 USB 安装应用」是否已开\n"
+            "       3) 关掉「MIUI / HyperOS 优化」再重启试一次"
+        )
+    return (
+        f"{head}\n"
+        "       逐条排查：\n"
+        "       1) 小米 / 红米：开发者选项 → 「USB 调试（安全设置）」，开完重启一次\n"
+        "       2) OPPO / vivo / 一加：开发者选项 → 关掉「权限监控」\n"
+        "       3) 其它机型：shell 拿不到 WRITE_SECURE_SETTINGS（release 版给不了），\n"
+        "          改成在设备上手动填代理，或走 --passive 被动模式"
+    )
+
+
+def probe_proxy_writable(adb: str, serial: str) -> bool:
+    """实际写一次 settings 看能不能落，写完立刻还原。
+
+    这是唯一可靠的判断方式：`getprop` 说开关开了、`dumpsys package` 说权限授了，
+    都不代表运行时真的放行（开关要重启才生效）。探测用一个无关的键，
+    不碰 http_proxy，免得把设备原本的代理设置冲掉。
+    """
+    key = "mitm_adb_probe"
+    write = _run([adb, "-s", serial, "shell", f"settings put global {key} 1"])
+    readable = _run([adb, "-s", serial, "shell", f"settings get global {key}"]).stdout.strip() == "1"
+    if readable:
+        _run([adb, "-s", serial, "shell", f"settings delete global {key}"])
+    return write.returncode == 0 and readable
+
+
 def set_proxy(adb: str, serial: str, value: str) -> subprocess.CompletedProcess[str]:
     return _run([adb, "-s", serial, "shell", f"settings put global http_proxy {value}"])
+
+
+def current_proxy(adb: str, serial: str) -> str:
+    """设备上当前的全局代理，没设时是字符串 null。"""
+    return _run([adb, "-s", serial, "shell", "settings get global http_proxy"]).stdout.strip()
 
 
 def cleanup(adb: str, serial: str, proxy_port: int) -> None:
@@ -1334,17 +1479,28 @@ def cleanup(adb: str, serial: str, proxy_port: int) -> None:
     print("\n[清理] 还原代理与隧道 ...")
     total = time.perf_counter()
 
+    # 顺序很重要：必须先撤 reverse，再清代理。
+    # 反过来的话，设备此刻的 http_proxy 还指着 127.0.0.1:8080，而这条隧道后面已经
+    # 没有 mitmproxy 了——设备上每条新起的进程（`settings` 自己就是个 app_process）
+    # 走网络时会先撞上这条死连接，表现为命令卡到超时（2026-11-02 实测，红米
+    # M786BC 上 `settings put` 和 `reverse --remove` 先后各卡满 20 秒，代理反而没清掉）。
+    # 先拆隧道，设备立刻回到直连，后面那条 settings 写起来就是秒回。
+    t = time.perf_counter()
+    _run([adb, "-s", serial, "reverse", "--remove", f"tcp:{proxy_port}"])
+    print(f"      撤销反向隧道  {time.perf_counter() - t:.1f}s")
+
     t = time.perf_counter()
     r = set_proxy(adb, serial, ":0")
     print(f"      清除全局代理  {time.perf_counter() - t:.1f}s")
     if r.returncode != 0:
         # 这一步失败最讨厌：代理留着，设备上所有 App 都会"断网"
-        print("      [警告] 代理可能没清掉！手动执行一次：")
+        raw = r.stderr.strip() or r.stdout.strip()
+        print("      [警告] 代理可能没清掉！")
+        if "SecurityException" in raw:
+            print("             设备拒绝了 settings 写入，原因和刚才设不上代理是同一个：")
+            print(f"             {settings_denied_hint(adb, serial).replace(chr(10) + '       ', chr(10) + '             ')}")
+        print("             手动兜底（在设备上关掉 WLAN 代理开关即可），或执行：")
         print(f'             adb -s {serial} shell "settings put global http_proxy :0"')
-
-    t = time.perf_counter()
-    _run([adb, "-s", serial, "reverse", "--remove", f"tcp:{proxy_port}"])
-    print(f"      撤销反向隧道  {time.perf_counter() - t:.1f}s")
 
     print(f"      完成，设备已恢复直连（共 {time.perf_counter() - total:.1f}s）")
 
@@ -2132,6 +2288,33 @@ def main() -> None:
         if not args.reboot:
             return
 
+    # 先实测能不能写 settings，再建隧道。不能只信 getprop：小米/红米那个开关
+    # 打开后属性立刻是 1，但 system_server 没重启就照样写不进去（见 MIUI_ADBINPUT_PROP
+    # 上面的说明）。这一步失败就直接给出可执行的替代方案，别建完隧道又回头收尾。
+    if not probe_proxy_writable(adb, target.serial):
+        _die(f"设置代理失败：\n       {settings_denied_hint(adb, target.serial)}")
+
+    # 端口先查清，再动设备。反过来的话 mitmweb 起不来会留下"代理指向死端口"的现场。
+    _check_ports_free(args.proxy_port, args.web_port, args.listen_host or "127.0.0.1")
+
+    # 代理一设上，设备就依赖本机的 8080；不管怎么退出都得把它清掉。
+    # finally 只兜得住正常退出和 KeyboardInterrupt，兜不住 os._exit、被 SIGTERM 打死、
+    # 或者 uv / .ps1 这类包装层把信号截走的情况（2026-11-02 实测 `timeout -s INT uv run`
+    # 就是这个结果：Python 被 SIGTERM 打死，代理留在 127.0.0.1:8080，设备直接断网）。
+    # atexit 挂在解释器退出路径上，比 finally 更靠后，用来兜住剩下那些情况。
+    cleanup_done = False
+    original_cleanup = cleanup
+
+    def _cleanup_once() -> None:
+        """只清一次，finally 和 atexit 谁先到都行。"""
+        nonlocal cleanup_done
+        if cleanup_done:
+            return
+        cleanup_done = True
+        original_cleanup(adb, target.serial, args.proxy_port)
+
+    atexit.register(_cleanup_once)
+
     print(f"[2/4] 建立反向隧道 tcp:{args.proxy_port} ...")
     r = _run([adb, "-s", target.serial, "reverse", f"tcp:{args.proxy_port}", f"tcp:{args.proxy_port}"])
     if r.returncode != 0:
@@ -2140,7 +2323,22 @@ def main() -> None:
     print(f"[3/4] 设置设备全局代理 127.0.0.1:{args.proxy_port} ...")
     r = set_proxy(adb, target.serial, f"127.0.0.1:{args.proxy_port}")
     if r.returncode != 0:
-        _die(f"设置代理失败：{r.stderr.strip() or r.stdout.strip() or '见上面的警告'}")
+        # 隧道已经建好了，代理这一步失败就得先撤掉，不然设备上留一条无用的映射
+        _run([adb, "-s", target.serial, "reverse", "--remove", f"tcp:{args.proxy_port}"])
+        raw = r.stderr.strip() or r.stdout.strip()
+        if "SecurityException" in raw:
+            _die(f"设置代理失败：\n       {settings_denied_hint(adb, target.serial)}")
+        _die(f"设置代理失败：{_setting_error_line(raw) if raw else '见上面的警告'}")
+
+    # 写进去不代表生效：个别 ROM 会静默丢弃，回读一次才算数
+    applied = current_proxy(adb, target.serial)
+    if applied != f"127.0.0.1:{args.proxy_port}":
+        _run([adb, "-s", target.serial, "reverse", "--remove", f"tcp:{args.proxy_port}"])
+        _die(
+            f"设置代理失败：写入后回读是 {applied or '空'}，不是 127.0.0.1:{args.proxy_port}\n"
+            "       系统把这个值丢掉或改了，多半是设备上有策略类应用（安全中心 / 企业管控）\n"
+            "       在接管网络设置；改成设备上手动填代理，或走 --passive 被动模式"
+        )
 
     print("[4/4] 启动 mitmweb")
     try:
@@ -2160,7 +2358,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        cleanup(adb, target.serial, args.proxy_port)
+        # atexit 那边也会调，_cleanup_once 保证只清一次
+        _cleanup_once()
 
 
 if __name__ == "__main__":
