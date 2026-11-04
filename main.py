@@ -55,6 +55,7 @@
            见下面「设备系统证书」
         1. 连设备：<ip>:<端口> 直接 adb connect；只写序列号 = USB 直连；
            写 <序列号>:<端口> = 先经该 USB 设备把端口转发到本机回环，再 connect 回环地址；
+           不给 target（或加 --discover）= 用 mDNS 自动找无线调试设备，不用手抄 IP:端口；
            加 --pair <码> 则先配对（无线调试第一次连必须，见下）
         2. adb reverse tcp:8080 tcp:8080  （设备本地 8080 → PC 的 8080，走 adb 隧道）
         3. 把设备全局代理指向 127.0.0.1:8080
@@ -78,6 +79,14 @@
     配对成功后 key 就留在设备里了，之后只 connect；换电脑、删过 ~/.android/adbkey
     才算重新「第一次」。弹窗一关，配对端口和码立刻作废，一个码只能用一次。
     不给 target 时连接端口也交给 mDNS（同一台设备靠服务名里的序列号对上）。
+
+无线调试免手抄端口（--discover，或不给 target）:
+    无线调试每开关一次就换一个随机连接端口，手抄的地址很快就会失效。这条路上
+    adb 会用 mDNS 自己找：先看 adb 里已在线的那台（server 没重启就还在），
+    没有就现查 mDNS 里广播的 _adb-tls-connect._tcp，拿到当前地址再 connect。
+    前提是这台电脑已经和设备配过对（见上一节），而且平板亮着屏——安卓息屏/省电时
+    会丢掉 mDNS 查询，那段时间里 `adb mdns services` 是空的，重开屏重跑即可。
+    能查到多台时不会替你猜哪台，直接把地址列出来让你指定。
 
 设备系统证书（--cert-install / --cert-uninstall）:
     mitmproxy 自己的 CA 得躺在设备的系统证书目录里才会被信任，这两步脚本可以代劳
@@ -936,6 +945,10 @@ def find_adb(explicit: str | None) -> str:
 def list_devices(adb: str) -> None:
     """列出 adb 认到的设备，并给出每个设备能直接用的 target 写法。
 
+    分两段，互不影响：先是 `adb devices` 里的设备，再是 mDNS 里看见但还没连上的。
+    「adb 里没有」和「局域网里没有」是两回事——只按前者判断，连过一台之后
+    另一台新开的设备就再也看不到了。
+
     USB 设备的序列号就是 `adb devices` 第一列（设备自己的 ro.serialno）；
     网络设备的"序列号"是 ip:端口，本身就已经是完整 target。
     """
@@ -951,30 +964,126 @@ def list_devices(adb: str) -> None:
         model = next((x[len("model:"):] for x in parts[2:] if x.startswith("model:")), "")
         rows.append((parts[0], parts[1], model))
 
-    if not rows:
-        print("\n没有设备在线。")
-        print("  USB    ：检查数据线（要能传数据）、平板上「允许 USB 调试」是否点过")
-        print("  无线   ：看平板开发者选项里的「无线调试」，用主页上的 IP:端口 adb connect")
-        print("  首次连 ：这台电脑没和它配过对时 connect 一定失败，先 uv run main.py --pair <六位码>")
-        return
+    # mDNS 自动连上的设备，adb 把它记成「服务名._adb-tls-connect._tcp」。这种序列号里
+    # 没有冒号，只看冒号会把它当成 USB 设备，于是给出一堆「USB 转发 / 虚拟机」的错提示。
+    # 判据用后缀而不是「去 mDNS 列表里查」：列表在设备息屏时会是空的，而序列号一直在。
+    serials = {row[0] for row in rows}
+    # --discover 那边一直在轮询，--list 早先只查一次就返回，于是「刚连上的设备
+    # 这里看不到，过一会儿又有了」——mDNS 是一层层缓存出来的，一次查询多半还是旧结果。
+    # 这里走完一个 5 秒窗口，让晚应答的设备也能报上来。放在打印设备之前，
+    # 免得那一行等待提示夹在设备列表中间。
+    print("查 mDNS（最多等 5 秒，让晚应答的设备也报上来） ...")
+    found = _collect_mdns(adb, wait=MDNS_LOOKUP_SECONDS)
+    # 长名字 → ip:端口。名字在 adb server 重启后就不存在了，地址反而还查得到，
+    # 所以显示时优先用地址（人也好认得多）。
+    mdns_names: dict[str, str] = {f"{s.name}.{CONNECT_SERVICE}": s.address for s in found}
 
-    print("\nadb 认到的设备：")
-    for serial, state, model in rows:
-        print(f"  {serial:<22} {state:<14} {model}")
-        if state != "device":
-            print("    （状态不是 device，先处理授权/掉线，再谈抓包）")
-            if ":" in serial:
-                print(f"    （无线调试没配过对就卡在这：uv run main.py {serial} --pair <六位码>）")
-            continue
-        if ":" in serial:
-            print(f"    -> uv run main.py {serial}")
-        else:
+    if rows:
+        print("\nadb 认到的设备：")
+        for serial, state, model in rows:
+            print(f"  {serial:<22} {state:<14} {model}")
+            if state != "device":
+                print("    （状态不是 device，先处理授权/掉线，再谈抓包）")
+                if ":" in serial:
+                    print(f"    （无线调试没配过对就卡在这里：uv run main.py {serial} --pair <六位码>）")
+                continue
+            if ":" in serial or MDNS_SUFFIX_RE.search(serial):
+                print(f"    -> uv run main.py {mdns_names.get(serial, serial)}")
+                continue
             print(f"    -> uv run main.py {serial} --emudhra      # 抓平板本身")
-            print(f"    -> uv run main.py {serial}:6556           # 抓平板里的虚拟机")
+            # 虚拟机那行只在它真开着、且还没自己出现在列表里时才给：6556 上没进程监听
+            # 的话给了也连不上，白白让人以为虚拟机在跑；而虚拟机一旦连过，adb 会把它
+            # 当成独立一条列出来，上面已经给过写法，这里再给就重复了。探测见 _vm_running()。
+            vm_serial = f"{serial}:{VM_PORT}"
+            if vm_serial not in serials and _vm_running(adb, serial):
+                print(f"    -> uv run main.py {vm_serial}           # 抓平板里的虚拟机")
+    else:
+        print("\n没有设备在线。")
+        print("  USB  ：检查数据线（要能传数据）、平板上「允许 USB 调试」是否点过")
+        print("  无线 ：开发者选项里打开「无线调试」，等几秒这里会自己冒出来")
+        print("  首次连：这台电脑没和它配过对时 connect 一定失败，先 uv run main.py --pair <六位码>")
+
+    _list_mdns(found, serials, rows)
+
+
+def _list_mdns(
+    found: list[MdnsService], serials: set[str], rows: list[tuple[str, str, str]]
+) -> None:
+    """把 mDNS 里看见、adb 还没连上的无线调试设备列出来。
+
+    这一节和上面有没有设备无关：连过 A 之后新开的 B 只在 mDNS 里，按
+    「adb devices 空不空」来判就永远看不到它。
+
+    found 由调用方（list_devices）传入，因为那份结果还要用来把长名字换成地址，
+    不值得再查一轮——mDNS 每查一轮都要等 5 秒。
+    """
+    fresh = [
+        s
+        for s in found
+        if s.address not in serials and f"{s.name}.{CONNECT_SERVICE}" not in serials
+    ]
+    if fresh:
+        print("\nmDNS 发现的无线调试设备（还没连上）：")
+        for s in fresh:
+            print(f"  {s.address:<22} {s.name}")
+        print(f"    -> uv run main.py {fresh[0].address}")
+    elif not rows:
+        print("\n  mDNS ：没有设备广播无线调试（没开无线调试，或路由器 AP 隔离）")
     print()
 
 
+def _collect_mdns(adb: str, wait: float) -> list[MdnsService]:
+    """在一个时间窗口内反复查 mDNS，返回见过的全部服务（按地址去重）。
+
+    和 discover_wireless 的区别：那个一查到就返回（只有一个目标，够用），这个
+    要把窗口期走完——多台设备不一定同时应答，早返回就会漏掉晚到的那几台。
+    """
+    seen: dict[str, MdnsService] = {}
+    deadline = time.time() + wait
+    while True:
+        for s in mdns_services(adb, CONNECT_SERVICE):
+            seen[s.address] = s
+        if time.time() >= deadline:
+            return list(seen.values())
+        time.sleep(MDNS_POLL_INTERVAL)
+
+
+# 虚拟机 adbd 的端口（android.host.adb.port）。写死不是懒：它就是虚拟机镜像里
+# 配死的值，客户端这边无从探测出别的号来。
+VM_PORT: int = 6556
+
+
+def _vm_running(adb: str, serial: str) -> bool:
+    """设备上 6556 有没有进程在监听，等于「里面的虚拟机开着吗」。
+
+    为什么不用 `adb connect <serial>:6556` 试：connect 失败时 adb 会留下一条
+    offline 记录，`--list` 跑两次就会在设备列表里多出个假的僵尸设备。
+    读 /proc/net/tcp{,6} 是纯只读的，什么都不改。
+
+    端口在 /proc 里是十六进制（6556 = 0x199C），状态列 0A 表示 LISTEN。
+    读不到（新系统收紧 /proc 权限）就当没开——少给一行提示，比给错强。
+    """
+    want = f":{VM_PORT:04X}"
+    r = _run(
+        [adb, "-s", serial, "shell", "cat /proc/net/tcp /proc/net/tcp6"],
+        timeout=10,
+    )
+    if r.returncode != 0:
+        return False
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        # 第 2 列 local_address 形如 0000000000000000:199C，第 4 列 st
+        if len(parts) >= 4 and parts[3] == "0A" and parts[1].endswith(want):
+            return True
+    return False
+
+
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+# mDNS 自动连上的设备在 `adb devices` 里的序列号长这样：
+#   adb-9f2ac82e-v9sKWC._adb-tls-connect._tcp
+# 它本质上是「mDNS 服务名.服务类型」，不是设备自己的序列号，所以不能当 USB 设备看待。
+MDNS_SUFFIX_RE = re.compile(r"\._adb-tls-connect\._tcp$")
 
 
 @dataclass(frozen=True)
@@ -1011,7 +1120,10 @@ def resolve_target(raw: str) -> Target:
 
     if ":" not in target:
         if _IPV4_RE.match(target):
-            _die(f"{target} 少了端口，写成 {target}:<端口>（虚拟机 6556，无线调试看开发者选项里的端口）")
+            _die(
+                f"{target} 少了端口，写成 {target}:<端口>"
+                f"（虚拟机 {VM_PORT}，无线调试看开发者选项里的端口）"
+            )
         return Target(serial=target)
 
     host, _, port_text = target.rpartition(":")
@@ -1092,6 +1204,90 @@ def mdns_services(adb: str, kind: str) -> list[MdnsService]:
         if len(parts) >= 3 and parts[1] == kind and ":" in parts[2]:
             found.append(MdnsService(parts[0], parts[1], parts[2]))
     return found
+
+
+# 启动 adb server 之后 mDNS 那边要重新发一轮 query 才收得到应答，实测 5~10 秒才冒出来。
+# 轮询到这个上限还没看见就是真没有（而不是「再等等就有了」）。
+MDNS_WAIT_SECONDS: float = 20.0
+MDNS_POLL_INTERVAL: float = 1.0
+
+# `--list` 是给人看一眼的，不能像 --discover 那样等 20 秒。5 秒够走完一轮查询+应答，
+# 又不至于让人以为命令卡住了。
+MDNS_LOOKUP_SECONDS: float = 5.0
+
+
+def discover_wireless(adb: str, wait: float = MDNS_WAIT_SECONDS) -> list[MdnsService]:
+    """轮询 mDNS，等无线调试设备自己出现。
+
+    为什么不能只查一次：adb server 刚起来时 mDNS 的应答还没回来，一次查询几乎总是
+    空。这里反复查，第一次查到就返回；wait 秒还没查到返回空列表。
+
+    返回的只是「mDNS 里广播着连接服务」的设备——它们是不是配过对，只有 adb connect
+    试过才知道。
+    """
+    deadline = time.time() + wait
+    while True:
+        found = mdns_services(adb, CONNECT_SERVICE)
+        if found:
+            return found
+        if time.time() >= deadline:
+            return []
+        time.sleep(MDNS_POLL_INTERVAL)
+
+
+def _connected_wireless(adb: str) -> list[str]:
+    """adb 里已经是 device 状态的网络设备（序列号形如 ip:端口）。
+
+    这些不用 mDNS 也能连——它们就是之前连过、adb server 还没重启过的那几台。
+    """
+    out = _run([adb, "devices"]).stdout
+    serials: list[str] = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device" and _IPV4_RE.match(parts[0].rpartition(":")[0]):
+            serials.append(parts[0])
+    return serials
+
+
+def auto_target(adb: str, wait: float = MDNS_WAIT_SECONDS) -> Target:
+    """不给 target 时，自己找一台无线调试设备连。
+
+    两条路，按「猜错代价从小到大」排：
+
+    1. adb 里已经在线的那台——最省事，adb server 活着就不用重新发现；
+    2. mDNS 现查——设备端口每次开关无线调试都会变，但 mDNS 里的服务名跟着变，
+       所以每次都能拿到当前该连的那个地址。
+
+    mDNS 这条路在 Android 息屏/省电时经常收不到应答（设备会丢掉多播查询），
+    所以第 1 条不是优化，是让「刚连过、只是没写 target」这种情况不必重新发现。
+
+    只挑一台：多台报错并列出地址——蒙一台连上的后果是操作了错误的设备。
+    """
+    online = _connected_wireless(adb)
+    if len(online) == 1:
+        print(f"[发现] 复用已连上的无线设备 {online[0]}")
+        return Target(serial=online[0], connect=online[0])
+    if len(online) > 1:
+        rows = "\n".join(f"         {s}" for s in online)
+        _die(f"adb 里有 {len(online)} 台无线设备在线，用 target 指定连哪台：\n{rows}")
+
+    print(f"[发现] 查 mDNS 找无线调试设备（最多等 {wait:.0f} 秒） ...")
+    found = discover_wireless(adb, wait)
+    if not found:
+        _die(
+            "mDNS 里没找到开着无线调试的设备。按顺序确认：\n"
+            "       1) 平板亮屏、开发者选项里的「无线调试」是开着的（息屏省电时会不应答查询）\n"
+            "       2) 平板和这台 PC 在同一局域网，路由器没开 AP 隔离 / 访客网络\n"
+            "       3) Windows 上 mDNS 后端（Bonjour 服务）在跑；用 --list 能看见 mDNS 条目就说明这条路通\n"
+            "       4) 直接给地址绕过去：uv run main.py <ip>:<端口>"
+        )
+    if len(found) > 1:
+        rows = "\n".join(f"         {s.address}   {s.name}" for s in found)
+        _die(f"mDNS 里有 {len(found)} 台无线调试设备，用 target 指定连哪台：\n{rows}")
+
+    service = found[0]
+    print(f"[发现] {service.name} -> {service.address}")
+    return Target(serial=service.address, connect=service.address)
 
 
 def _pairing_service(adb: str, target: Target | None) -> MdnsService:
@@ -2128,6 +2324,7 @@ def main() -> None:
             "  uv run main.py 10.1.162.244:6556          # 虚拟机（局域网）\n"
             "  uv run main.py 192.168.1.23:37015         # 平板无线调试\n"
             "  uv run main.py R58M1234AB --emudhra       # 平板 USB，免装证书\n"
+            "  uv run main.py --discover                 # 无线调试，端口自动找（不用抄 IP）\n"
             "  uv run main.py R58M1234AB:6556            # 虚拟机，走平板 USB 转发（不依赖网络）\n"
             "  uv run main.py 10.1.162.244:6556 --cert-install    # 装系统证书（装完退出，不重启）\n"
             "  uv run main.py 10.1.162.244:6556 --cert-install --reboot  # 装完重启、等回来再抓包\n"
@@ -2161,6 +2358,14 @@ def main() -> None:
         help=(
             "用六位配对码和无线调试设备配对：这台电脑第一次连它时必须做一次，之后只 connect。"
             "配对端口默认从 mDNS 找，找不到用 --pair-port；不给 target 时连「连哪个端口」也交给 mDNS"
+        ),
+    )
+    p.add_argument(
+        "--discover",
+        action="store_true",
+        help=(
+            "不给 target，用 mDNS 自动找无线调试设备（adb 里已在线的那台直接复用）。"
+            "不用手抄 IP:端口——无线调试每次开关都会换端口，这里每次都能拿到当前的"
         ),
     )
     p.add_argument(
@@ -2317,13 +2522,8 @@ def main() -> None:
         )
         return
 
+    # 不给 target 就走自动发现（见 auto_target），所以这里不再拦
     adb = find_adb(args.adb)
-    if not args.target and not args.pair:
-        _die(
-            "没给 target。先跑 uv run main.py --list 看有哪些设备，按提示里的写法填；"
-            "首次连无线调试要先配对：uv run main.py --pair <六位码>；"
-            "只想监听端口让设备自己连过来，就加 --passive"
-        )
 
     target: Target | None = resolve_target(args.target) if args.target else None
 
@@ -2336,7 +2536,10 @@ def main() -> None:
         device_id = pair_device(adb, args.pair, target, args.pair_port)
         target = wireless_target(adb, target, device_id)
     if target is None:
-        _die("没确定要连哪台设备")
+        # 没给 target 就走自动发现（--discover，或干脆一个 target 都不写）：
+        # 无线调试端口每次开关都会变，但 mDNS 里的服务名跟着变，所以这条路上
+        # 不需要人记住任何 IP:端口。
+        target = auto_target(adb)
     if (args.cert_install or args.cert_uninstall) and emudhra:
         _die("--emudhra 用的是泄露 CA，设备端本来就不需要证书；装 / 卸证书和它别一起给")
     if args.reboot and not args.cert_install:
