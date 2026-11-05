@@ -5,9 +5,10 @@
 用法:
     uv sync
     cp .env.example .env   # 填上 DECRYPT_KEY / DECRYPT_IV
-    uv run main.py --list                       # 先看设备序列号（USB 插着才有）
+    uv run main.py --list                       # 先看有哪些设备：先列已连接的，再查 mDNS
     uv run main.py 10.1.162.244:6556            # 虚拟机（局域网，adbd 固定 6556）
     uv run main.py 192.168.1.23:37015           # 物理平板（无线调试）
+    uv run main.py --discover                   # 无线调试：用 mDNS 自动找，不用抄 IP:端口
     uv run main.py R58M1234AB --emudhra         # 物理平板（USB 直连，免装证书）
     uv run main.py R58M1234AB:6556              # 虚拟机（经物理平板 USB 转发，不依赖网络）
     uv run main.py --pair 123456                # 首次无线调试：六位配对码，端口自动从 mDNS 找
@@ -58,7 +59,8 @@
            见下面「设备系统证书」
         1. 连设备：<ip>:<端口> 直接 adb connect；只写序列号 = USB 直连；
            写 <序列号>:<端口> = 先经该 USB 设备把端口转发到本机回环，再 connect 回环地址；
-           不给 target（或加 --discover）= 用 mDNS 自动找无线调试设备，不用手抄 IP:端口；
+           加 --discover = 用 mDNS 自动找无线调试设备，不用手抄 IP:端口（不给 target
+           又没加这个开关会直接报错，不替你猜设备）；
            加 --pair <码> 则先配对（无线调试第一次连必须，见下）
         2. adb reverse tcp:8080 tcp:8080  （设备本地 8080 → PC 的 8080，走 adb 隧道）
         3. 把设备全局代理指向 127.0.0.1:8080
@@ -83,10 +85,13 @@
     才算重新「第一次」。弹窗一关，配对端口和码立刻作废，一个码只能用一次。
     不给 target 时连接端口也交给 mDNS（同一台设备靠服务名里的序列号对上）。
 
-无线调试免手抄端口（--discover，或不给 target）:
-    无线调试每开关一次就换一个随机连接端口，手抄的地址很快就会失效。这条路上
-    adb 会用 mDNS 自己找：先看 adb 里已在线的那台（server 没重启就还在），
-    没有就现查 mDNS 里广播的 _adb-tls-connect._tcp，拿到当前地址再 connect。
+无线调试免手抄端口（--discover）:
+    无线调试每开关一次就换一个随机连接端口，手抄的地址很快就会失效。加上 --discover
+    就不用给 target：adb 会用 mDNS 自己找——先看 adb 里已在线的那台（server 没重启
+    就还在），没有就现查 mDNS 里广播的 _adb-tls-connect._tcp，拿到当前地址再 connect。
+    反过来，不给 target 也没加 --discover 时脚本会直接报错：自动挑一台的代价是可能
+    操作了错误的设备，所以这件事必须显式要求。--pair 是唯一的例外——配对本身就得靠
+    mDNS 定位那台设备，它可以不带 target 也不带 --discover。
     前提是这台电脑已经和设备配过对（见上一节），而且平板亮着屏——安卓息屏/省电时
     会丢掉 mDNS 查询，那段时间里 `adb mdns services` 是空的，重开屏重跑即可。
     能查到多台时不会替你猜哪台，直接把地址列出来让你指定。
@@ -969,9 +974,13 @@ def find_adb(explicit: str | None) -> str:
 def list_devices(adb: str) -> None:
     """列出 adb 认到的设备，并给出每个设备能直接用的 target 写法。
 
-    分两段，互不影响：先是 `adb devices` 里的设备，再是 mDNS 里看见但还没连上的。
+    分两段，互不影响：先是 `adb devices` 里已经连上的，再是 mDNS 里看见但还没连上的。
     「adb 里没有」和「局域网里没有」是两回事——只按前者判断，连过一台之后
     另一台新开的设备就再也看不到了。
+
+    两段的顺序是有意的：`adb devices` 秒回，mDNS 得走完一个时间窗口才收得全。先把
+    手上这台能立刻看到的打出来，再花那 5 秒去等晚应答的设备——反过来（先等再显示）
+    会让人对着空屏幕怀疑命令卡住了，而那时答案其实早就有了。
 
     USB 设备的序列号就是 `adb devices` 第一列（设备自己的 ro.serialno）；
     网络设备的"序列号"是 ip:端口，本身就已经是完整 target。
@@ -992,46 +1001,74 @@ def list_devices(adb: str) -> None:
     # 没有冒号，只看冒号会把它当成 USB 设备，于是给出一堆「USB 转发 / 虚拟机」的错提示。
     # 判据用后缀而不是「去 mDNS 列表里查」：列表在设备息屏时会是空的，而序列号一直在。
     serials = {row[0] for row in rows}
+
+    # 第一段要用「mDNS 序列号 → ip:端口」换掉那个长名字，所以先查一次 mDNS。这次查的是
+    # adb server 里已有的缓存，毫秒级、不等窗口：设备既然能出现在列表里，server 就是靠
+    # mDNS 连上它的，缓存里多半已经有那条记录。拿不到也不要紧，退回显示序列号（它本身
+    # 也是合法 target），下面 _list_mdns 会用走完窗口的结果再补一次。
+    early: dict[str, str] = {
+        f"{s.name}.{CONNECT_SERVICE}": s.address for s in mdns_services(adb, CONNECT_SERVICE)
+    }
+
+    _print_devices(adb, rows, serials, early)
+
     # --discover 那边一直在轮询，--list 早先只查一次就返回，于是「刚连上的设备
     # 这里看不到，过一会儿又有了」——mDNS 是一层层缓存出来的，一次查询多半还是旧结果。
-    # 这里走完一个 5 秒窗口，让晚应答的设备也能报上来。放在打印设备之前，
-    # 免得那一行等待提示夹在设备列表中间。
+    # 这里走完一个 5 秒窗口，让晚应答的设备也能报上来。
     print("查 mDNS（最多等 5 秒，让晚应答的设备也报上来） ...")
     found = _collect_mdns(adb, wait=MDNS_LOOKUP_SECONDS)
     # 长名字 → ip:端口。名字在 adb server 重启后就不存在了，地址反而还查得到，
     # 所以显示时优先用地址（人也好认得多）。
-    mdns_names: dict[str, str] = {f"{s.name}.{CONNECT_SERVICE}": s.address for s in found}
+    names: dict[str, str] = {f"{s.name}.{CONNECT_SERVICE}": s.address for s in found}
 
-    if rows:
-        print("\nadb 认到的设备：")
-        for serial, state, model in rows:
-            print(f"  {serial:<22} {state:<14} {model}")
-            if state != "device":
-                print("    （状态不是 device，先处理授权/掉线，再谈抓包）")
-                if ":" in serial:
-                    print(f"    （无线调试没配过对就卡在这里：uv run main.py {serial} --pair <六位码>）")
-                continue
-            if ":" in serial or MDNS_SUFFIX_RE.search(serial):
-                print(f"    -> uv run main.py {mdns_names.get(serial, serial)}")
-                continue
-            print(f"    -> uv run main.py {serial} --emudhra      # 抓平板本身")
-            # 虚拟机那行只在它真开着、且还没自己出现在列表里时才给：6556 上没进程监听
-            # 的话给了也连不上，白白让人以为虚拟机在跑；而虚拟机一旦连过，adb 会把它
-            # 当成独立一条列出来，上面已经给过写法，这里再给就重复了。探测见 _vm_running()。
-            vm_serial = f"{serial}:{VM_PORT}"
-            if vm_serial not in serials and _vm_running(adb, serial):
-                print(f"    -> uv run main.py {vm_serial}           # 抓平板里的虚拟机")
-    else:
+    _list_mdns(found, serials, rows, early, names)
+
+
+def _print_devices(
+    adb: str,
+    rows: list[tuple[str, str, str]],
+    serials: set[str],
+    names: dict[str, str],
+) -> None:
+    """打印 `adb devices -l` 这一段——立刻能拿到的部分，不等 mDNS。
+
+    names 只用来把 mDNS 序列号换成 ip:端口；查不到就写序列号本身。那种写法也能跑，
+    只是脚本会把它当 USB 直连（于是少了 connect、多一句无关的「没 root」提示），
+    所以 _list_mdns 里还会用完整结果补一次。
+    """
+    if not rows:
         print("\n没有设备在线。")
         print("  USB  ：检查数据线（要能传数据）、平板上「允许 USB 调试」是否点过")
         print("  无线 ：开发者选项里打开「无线调试」，等几秒这里会自己冒出来")
         print("  首次连：这台电脑没和它配过对时 connect 一定失败，先 uv run main.py --pair <六位码>")
+        return
 
-    _list_mdns(found, serials, rows)
+    print("\nadb 认到的设备：")
+    for serial, state, model in rows:
+        print(f"  {serial:<22} {state:<14} {model}")
+        if state != "device":
+            print("    （状态不是 device，先处理授权/掉线，再谈抓包）")
+            if ":" in serial:
+                print(f"    （无线调试没配过对就卡在这里：uv run main.py {serial} --pair <六位码>）")
+            continue
+        if ":" in serial or MDNS_SUFFIX_RE.search(serial):
+            print(f"    -> uv run main.py {names.get(serial, serial)}")
+            continue
+        print(f"    -> uv run main.py {serial} --emudhra      # 抓平板本身")
+        # 虚拟机那行只在它真开着、且还没自己出现在列表里时才给：6556 上没进程监听
+        # 的话给了也连不上，白白让人以为虚拟机在跑；而虚拟机一旦连过，adb 会把它
+        # 当成独立一条列出来，上面已经给过写法，这里再给就重复了。探测见 _vm_running()。
+        vm_serial = f"{serial}:{VM_PORT}"
+        if vm_serial not in serials and _vm_running(adb, serial):
+            print(f"    -> uv run main.py {vm_serial}           # 抓平板里的虚拟机")
 
 
 def _list_mdns(
-    found: list[MdnsService], serials: set[str], rows: list[tuple[str, str, str]]
+    found: list[MdnsService],
+    serials: set[str],
+    rows: list[tuple[str, str, str]],
+    early: dict[str, str],
+    names: dict[str, str],
 ) -> None:
     """把 mDNS 里看见、adb 还没连上的无线调试设备列出来。
 
@@ -1040,6 +1077,10 @@ def _list_mdns(
 
     found 由调用方（list_devices）传入，因为那份结果还要用来把长名字换成地址，
     不值得再查一轮——mDNS 每查一轮都要等 5 秒。
+
+    early 是第一段已经用过的映射，names 是走完窗口后的完整映射。两者之差就是
+    「第一段查缓存时还没赶上、这一轮才查到的」——补偿那一部分，否则那几台会一直
+    显示成会被误当成 USB 的序列号。
     """
     fresh = [
         s
@@ -1053,6 +1094,20 @@ def _list_mdns(
         print(f"    -> uv run main.py {fresh[0].address}")
     elif not rows:
         print("\n  mDNS ：没有设备广播无线调试（没开无线调试，或路由器 AP 隔离）")
+
+    late = [
+        (serial, names[serial])
+        for serial, state, _ in rows
+        if state == "device"
+        and MDNS_SUFFIX_RE.search(serial)
+        and serial not in early
+        and serial in names
+    ]
+    if late:
+        print("\n上面那几台的 mDNS 地址（比序列号好认）：")
+        for serial, address in late:
+            print(f"  {serial}")
+            print(f"    -> uv run main.py {address}")
     print()
 
 
@@ -1236,7 +1291,7 @@ MDNS_WAIT_SECONDS: float = 20.0
 MDNS_POLL_INTERVAL: float = 1.0
 
 # `--list` 是给人看一眼的，不能像 --discover 那样等 20 秒。5 秒够走完一轮查询+应答，
-# 又不至于让人以为命令卡住了。
+# 又不至于让人干等——何况这一轮是在「已连接的设备」打印完之后才开始的，不是白等。
 MDNS_LOOKUP_SECONDS: float = 5.0
 
 
@@ -1274,7 +1329,7 @@ def _connected_wireless(adb: str) -> list[str]:
 
 
 def auto_target(adb: str, wait: float = MDNS_WAIT_SECONDS) -> Target:
-    """不给 target 时，自己找一台无线调试设备连。
+    """--discover 时，自己找一台无线调试设备连。
 
     两条路，按「猜错代价从小到大」排：
 
@@ -1283,9 +1338,11 @@ def auto_target(adb: str, wait: float = MDNS_WAIT_SECONDS) -> Target:
        所以每次都能拿到当前该连的那个地址。
 
     mDNS 这条路在 Android 息屏/省电时经常收不到应答（设备会丢掉多播查询），
-    所以第 1 条不是优化，是让「刚连过、只是没写 target」这种情况不必重新发现。
+    所以第 1 条不是优化，是让「刚连过、只想重开一轮抓包」这种情况不必重新发现。
 
     只挑一台：多台报错并列出地址——蒙一台连上的后果是操作了错误的设备。
+    正因为这个代价，这条路只在 --discover 显式要求时才走，不给 target 也不给
+    开关时 main() 会直接报错，不替人猜。
     """
     online = _connected_wireless(adb)
     if len(online) == 1:
@@ -2370,7 +2427,10 @@ def main() -> None:
         "-l",
         "--list",
         action="store_true",
-        help="列出 adb 认到的设备（序列号 / 状态 / 型号）及可直接用的 target 写法，然后退出",
+        help=(
+            "列出 adb 认到的设备（序列号 / 状态 / 型号）及可直接用的 target 写法，然后退出："
+            "先把 adb 里已经连上的打出来，再花 5 秒查 mDNS 补上还没连上的"
+        ),
     )
     p.add_argument(
         "target",
@@ -2378,7 +2438,7 @@ def main() -> None:
         help=(
             "设备地址：<ip>:<端口>（局域网）| USB 序列号（adb devices 里那一列，直连物理机本身）"
             " | <序列号>:<端口>（经这台 USB 设备转发该端口，用于物理机里的虚拟机）；"
-            " --passive 时不用给"
+            " 加 --discover 自动找、或者 --passive 不碰设备时不用给"
         ),
     )
     p.add_argument(
@@ -2394,8 +2454,9 @@ def main() -> None:
         "--discover",
         action="store_true",
         help=(
-            "不给 target，用 mDNS 自动找无线调试设备（adb 里已在线的那台直接复用）。"
-            "不用手抄 IP:端口——无线调试每次开关都会换端口，这里每次都能拿到当前的"
+            "不用给 target，改用 mDNS 自动找无线调试设备（adb 里已在线的那台直接复用）。"
+            "不用手抄 IP:端口——无线调试每次开关都会换端口，这里每次都能拿到当前的。"
+            "不给 target 又没加这个开关会直接报错；和 target 互斥"
         ),
     )
     p.add_argument(
@@ -2512,6 +2573,14 @@ def main() -> None:
         _die("--passive 不碰设备，配对得走自动模式（去掉 --passive）")
     if args.pair_port is not None and not args.pair:
         print("[提示] --pair-port 只配合 --pair 用，本次忽略")
+    # 两个都给就是没说清要哪个：--discover 的本意是「别让我记地址」，target 是
+    # 「我就要这台」，同时出现时照 target 跑或照发现跑都可能在操作另一台设备。
+    if args.discover and args.target:
+        _die(
+            "--discover 是让脚本自己找设备，和 target 别一起给：\n"
+            "       自己找：uv run main.py --discover\n"
+            "       指定这台：uv run main.py <ip>:<端口>"
+        )
 
     emudhra = "emudhra_old" if args.emudhra_old else ("emudhra" if args.emudhra else None)
     token = args.token or token_hex(8)
@@ -2549,6 +2618,8 @@ def main() -> None:
     if args.passive:
         if args.target:
             print(f"[提示] 被动模式下不操作设备，target {args.target} 已忽略")
+        if args.discover:
+            print("[提示] 被动模式下不操作设备，--discover 已忽略")
         run_passive(
             proxy_port,
             web_port,
@@ -2562,7 +2633,6 @@ def main() -> None:
         )
         return
 
-    # 不给 target 就走自动发现（见 auto_target），所以这里不再拦
     adb = find_adb(args.adb)
 
     target: Target | None = resolve_target(args.target) if args.target else None
@@ -2576,7 +2646,15 @@ def main() -> None:
         device_id = pair_device(adb, args.pair, target, args.pair_port)
         target = wireless_target(adb, target, device_id)
     if target is None:
-        # 没给 target 就走自动发现（--discover，或干脆一个 target 都不写）：
+        # 没给 target（--pair 若给了，上面一定会定出 target）。自动挑一台的代价是
+        # 可能操作了错误的设备，所以只有 --discover 明说过才做，不替人猜。
+        if not args.discover:
+            _die(
+                "没给 target，也没加 --discover，不知道该操作哪台设备。\n"
+                "       先看有哪些设备：uv run main.py --list\n"
+                "       无线调试不想抄端口：uv run main.py --discover\n"
+                "       手里有地址：uv run main.py <ip>:<端口>；USB 直连：uv run main.py <序列号>"
+            )
         # 无线调试端口每次开关都会变，但 mDNS 里的服务名跟着变，所以这条路上
         # 不需要人记住任何 IP:端口。
         target = auto_target(adb)
