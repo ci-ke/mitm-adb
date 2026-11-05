@@ -16,6 +16,7 @@
     uv run main.py 10.1.162.244:6556 --cert-install --reboot   # 装完重启、等它回来，接着抓包
     uv run main.py 10.1.162.244:6556 --cert-uninstall   # 把系统证书卸掉
     uv run main.py 10.1.162.244:6556 --upstream http://127.0.0.1:7897   # 再走本机上游代理
+    uv run main.py 10.1.162.244:6556 --env other.env   # 换一份配置（默认读脚本目录的 .env）
     uv run main.py --passive                    # 被动模式：只监听端口，设备自己设代理（iOS 用这个）
     uv run main.py --passive --listen-host 192.168.1.5   # 被动模式，只绑某一块网卡
     uv run main.py --passive --no-browser        # 不自动开浏览器（默认会开）
@@ -32,6 +33,8 @@
 
 配置:
     密钥等敏感信息只放在本目录的 .env（已在 .gitignore 里，不入库），模板见 .env.example。
+    --env <路径> 可以换一份文件来读（相对路径按当前目录算），适合按目标切白名单/密钥；
+    显式给的文件不存在会直接报错，而默认的 .env 缺失只是关掉解密、照常抓包。
     以下都可用同名真实环境变量覆盖（环境变量优先级更高）:
         DECRYPT_KEY      AES-128 密钥，16 字节
         DECRYPT_IV       AES-128 IV，16 字节
@@ -173,7 +176,8 @@ logger.setLevel(logging.INFO)
 # 响应解密
 # --------------------------------------------------------------------------
 
-# 敏感配置一律来自本目录的 .env（模板见 .env.example），脚本里不再写任何密钥。
+# 敏感配置一律来自本目录的 .env（模板见 .env.example），脚本里不再写任何密钥；
+# 用 --env <路径> 可以改读别的文件，见 pick_env_file()。
 ENV_FILE: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
 # AES-128-CBC 的 key/iv 长度都是 16 字节
@@ -195,7 +199,7 @@ class DecryptSecrets:
 
 
 def load_env(env_file: str = ENV_FILE) -> None:
-    """把 .env 灌进 os.environ。
+    """把 env 文件灌进 os.environ。
 
     override=False：已经存在的真实环境变量优先，方便临时用 DECRYPT_KEY=... 覆盖，
     CI 里也不必生成 .env 文件。
@@ -204,6 +208,26 @@ def load_env(env_file: str = ENV_FILE) -> None:
         print(f"[配置] 没找到 {env_file}，只用真实环境变量（模板见 .env.example）")
         return
     load_dotenv(env_file, override=False, encoding="utf-8")
+
+
+def pick_env_file(argv: list[str] | None = None) -> tuple[str, bool]:
+    """先抠出 --env，决定这次读哪个文件，返回 (绝对路径, 是否显式指定)。
+
+    .env 必须在读任何环境变量之前加载，而正式解析器在 load_env() 之后才跑，所以这里
+    用一个只认 --env 的临时解析器扫一遍：其余参数原样留给正式解析器，不在这里报错。
+    """
+    # allow_abbrev=False：只认完整的 --env，别把 --e 这种缩写抢过来当自己的参数；
+    # usage 只在这一步出错时（--env 后面没给值）露出来，写全一点免得像另一个程序
+    pre = argparse.ArgumentParser(
+        add_help=False,
+        allow_abbrev=False,
+        usage="%(prog)s [选项] [目标]",
+    )
+    pre.add_argument("--env", metavar="PATH", default=None)
+    known, _ = pre.parse_known_args(argv)
+    if known.env is None:
+        return ENV_FILE, False
+    return os.path.abspath(os.path.expanduser(known.env)), True
 
 
 def _read_secret(name: str) -> bytes | None:
@@ -2313,8 +2337,14 @@ def main() -> None:
         except Exception:
             pass
 
-    # .env 必须在读任何环境变量之前加载；已存在的真实环境变量优先，不会被覆盖
-    load_env()
+    # env 文件必须在读任何环境变量之前加载；已存在的真实环境变量优先，不会被覆盖。
+    # --env 只能在这里先抠（正式解析器还没跑），显式给了却不存在就是写错了，直接退出。
+    env_file, env_explicit = pick_env_file()
+    if env_explicit:
+        if not os.path.isfile(env_file):
+            _die(f"--env 指定的文件不存在: {env_file}")
+        print(f"[配置] env 文件: {env_file}")
+    load_env(env_file)
 
     p = argparse.ArgumentParser(
         description="抓取虚拟机 / 物理平板 / iOS 的流量（adb reverse 或被动监听 + mitmweb）",
@@ -2442,6 +2472,16 @@ def main() -> None:
         help=f"Web UI 端口（默认 {DEFAULT_WEB_PORT}；被占用时自动往后找，指定了则报错）",
     )
     p.add_argument("--token", default=None, help="Web UI 访问 token（默认随机生成）")
+    # 这里只为让 --env 出现在 --help 里；它的值早在 main() 开头被 pick_env_file() 用掉了
+    p.add_argument(
+        "--env",
+        metavar="PATH",
+        default=None,
+        help=(
+            "读哪个 env 文件（默认读脚本所在目录的 .env）；相对路径按当前目录算，"
+            "指定的文件必须存在，否则直接报错退出"
+        ),
+    )
     p.add_argument(
         "--upstream",
         default="auto",
