@@ -21,6 +21,7 @@
     uv run main.py --passive                    # 被动模式：只监听端口，设备自己设代理（iOS 用这个）
     uv run main.py --passive --listen-host 192.168.1.5   # 被动模式，只绑某一块网卡
     uv run main.py --passive --no-browser        # 不自动开浏览器（默认会开）
+    uv run main.py 10.1.162.244:6556 --allow-replay  # 放开 Web UI 的 Replay（默认禁用）
 
 三层可见性，逐层收窄（decrypt ⊆ probe ⊆ capture）:
     capture  记录谁——命中的连接都会出现在列表里。不写 = 什么都不记录，写 * = 全记。
@@ -134,6 +135,14 @@
     掉在固定宝箱（fixture 112，treasure_box_fixed）上的唱片不属于哪张地图的随机刷新
     点，浮层里不写地图名，直接写「固定位置」（设计图不从固定箱出，不受影响）。
     只在 Web UI 里体现，控制台不打印命中记录——连续采集时那会把屏刷掉。
+
+重放（--allow-replay）:
+    mitmweb 自带「Replay」按钮，默认禁用：它会把列表里那条请求原样再发给服务器。
+    抓到的请求里难免有带副作用的写操作，多打一次就等于凭空多一次操作，服务端容易当成
+    重复提交或异常流量，所以启动时就把这条路堵死——POST /flows/<id>/replay 直接回 400
+    并提示，replay.client / replay.client.file 命令也换成抛错（命令接口和
+    --set client_replay 那两条侧门一起关）。
+    确实需要重放（自己清楚在按什么）时再加 --allow-replay 放行。
 
 不落盘，不写 flows 文件。
 """
@@ -1145,6 +1154,79 @@ def install_webui() -> bool:
         return False
 
     _webui_installed = True
+    return True
+
+
+# --------------------------------------------------------------------------
+# 重放拦截
+# --------------------------------------------------------------------------
+
+# 拦下来时回给前端的文案：mitmweb 的 Replay 按钮拿到的就是这个错误提示
+REPLAY_REFUSED: str = "重放已禁用：本脚本只抓包，不会向服务器重发请求（要重放请用 --allow-replay 启动）"
+
+_replay_guard_installed: bool = False
+
+
+def _refuse_replay(*args: Any, **kwargs: Any) -> NoReturn:
+    """顶替 replay.client 的实现；签名放宽，谁调都直接报错。"""
+    from mitmproxy import exceptions
+
+    raise exceptions.CommandError(REPLAY_REFUSED)
+
+
+def install_replay_guard() -> bool:
+    """把 mitmweb 的 POST /flows/<id>/replay 换成直接拒绝（没给 --allow-replay 时调用）。
+
+    为什么要拦：列表里那些请求可能带副作用（提交、确认这类写操作），原样重发一次
+    等于凭空多一次操作，服务端很容易当成重复提交或异常流量。指望"别点那个按钮"
+    不现实，索性在服务端拒掉，点了也只会弹一句提示。
+
+    必须在 WebMaster(opts) 构造之前调用：Application 在构造时就把 handlers 抄走了。
+    这条只能挡住 Web UI；命令接口和 --set client_replay 那两条侧门见 disable_replay()。
+    """
+    global _replay_guard_installed
+    if _replay_guard_installed:
+        return True
+    try:
+        from mitmproxy.tools.web import app as webapp
+
+        class ReplayBlocked(webapp.RequestHandler):
+            def post(self, flow_id: str) -> None:
+                self.set_status(400)
+                self.finish(REPLAY_REFUSED)
+
+        for i, handler in enumerate(webapp.handlers):
+            if handler[0] == r"/flows/(?P<flow_id>[0-9a-f\-]+)/replay":
+                webapp.handlers[i] = (handler[0], ReplayBlocked)
+    except Exception as e:  # pragma: no cover - 版本变化时不影响抓包
+        print(f"      重放拦截: 失败（{e}），请勿在 Web UI 里点 Replay")
+        return False
+
+    _replay_guard_installed = True
+    return True
+
+
+def disable_replay(master: Any) -> bool:
+    """命令层兜底，堵住 Web UI 之外的两条侧门。
+
+    1. /commands/replay.client 这类通用命令接口——mitmweb 的 HTTP API 能直接调；
+    2. ClientPlayback.configure() 里的 --set client_replay，从文件读 flow 再重发。
+    命令表只是个普通 dict，clientplayback 又已经在默认 addon 链里，所以直接换掉
+    函数体最省事：不用卸载 addon，也不必和 mitmproxy 的内部结构较劲。
+    """
+    try:
+        for name in ("replay.client", "replay.client.file"):
+            cmd = master.commands.commands.get(name)
+            if cmd is not None:
+                # 只换实现，签名留着——Command 构造时已经校验过参数类型
+                cmd.func = _refuse_replay
+        playback = master.addons.get("clientplayback")
+        if playback is not None:
+            # configure() 里调的是 self.start_replay，改实例属性就能盖住类方法
+            setattr(playback, "start_replay", _refuse_replay)
+    except Exception as e:  # pragma: no cover - 版本变化时不影响抓包
+        print(f"      重放拦截: 命令层补丁失败（{e}）")
+        return False
     return True
 
 
@@ -2348,6 +2430,7 @@ async def _serve(
     rules: HostRules,
     emudhra: str | None,
     open_browser: bool = True,
+    block_replay: bool = True,
 ) -> None:
     from mitmproxy.tools.web.master import WebMaster
 
@@ -2355,6 +2438,8 @@ async def _serve(
     decrypt_on = secrets is not None and bool(rules.effective_decrypt())
     if decrypt_on:
         install_webui()
+    # 和 install_webui 一样要赶在 WebMaster 之前——Application 构造时抄走 handlers
+    replay_guard = install_replay_guard() if block_replay else False
 
     # web_* 选项由 WebAuth addon 注册，必须在 WebMaster 构造之后再赋值
     master = WebMaster(opts)
@@ -2374,6 +2459,15 @@ async def _serve(
         # 赋值会立刻触发 tlsconfig.configure()，把 certstore 的签发 CA 换成泄露的中间 CA
         setattr(master.options, emudhra, True)
         print(f"      证书: {emudhra} 模式（设备端无需安装证书）")
+
+    if block_replay:
+        # 命令层无论如何都要打补丁：路由那条没装上也还有它兜着
+        if disable_replay(master) and replay_guard:
+            print("      重放拦截: 已启用（Web UI 的 Replay 与 replay.client 一律拒绝）")
+        else:
+            print("      重放拦截: 没装全，注意别在 Web UI 里点 Replay")
+    else:
+        print("      重放拦截: 已放开（--allow-replay，重放会真的发到服务器）")
 
     if rules.needs_tunnel_record:
         master.addons.add(TunnelRecorder(rules))
@@ -2420,6 +2514,7 @@ def start_ui(
     listen_host: str = "127.0.0.1",
     passive: bool = False,
     open_browser: bool = True,
+    block_replay: bool = True,
 ) -> None:
     from mitmproxy import options
 
@@ -2492,6 +2587,7 @@ def start_ui(
             rules,
             emudhra,
             open_browser=open_browser,
+            block_replay=block_replay,
         )
     )
 
@@ -2534,6 +2630,7 @@ def run_passive(
     rules: HostRules,
     emudhra: str | None,
     open_browser: bool = True,
+    block_replay: bool = True,
 ) -> None:
     """被动模式：不碰设备，只在本机监听代理端口，等设备自己连过来。
 
@@ -2566,6 +2663,7 @@ def run_passive(
             listen_host=listen_host,
             passive=True,
             open_browser=open_browser,
+            block_replay=block_replay,
         )
     except (OSError, RuntimeError) as e:
         _die(f"启动失败：{e}")
@@ -2643,6 +2741,7 @@ def main() -> None:
             "  uv run main.py --pair 123456             # 首次无线调试：配六位码，端口自动找\n"
             "  uv run main.py 10.1.152.63:42463 --pair 123456 --pair-port 37123\n"
             "  uv run main.py --passive                  # 只监听，设备自己设代理（iOS）\n"
+            "  uv run main.py 10.1.162.244:6556 --allow-replay    # 放开 Web UI 的 Replay（默认禁用）\n"
         ),
     )
     p.add_argument(
@@ -2779,6 +2878,14 @@ def main() -> None:
         action="store_true",
         help="关闭请求/响应解密副本",
     )
+    p.add_argument(
+        "--allow-replay",
+        action="store_true",
+        help=(
+            "允许 mitmweb 的 Replay（默认禁用）：重放会把列表里的请求原样再发给服务器，"
+            "带副作用的写操作多打一次就多生效一次；默认点了只弹提示，加这个开关才真的发"
+        ),
+    )
     args = p.parse_args()
 
     if args.list and args.passive:
@@ -2852,6 +2959,7 @@ def main() -> None:
             rules,
             emudhra,
             open_browser=not args.no_browser,
+            block_replay=not args.allow_replay,
         )
         return
 
@@ -2963,6 +3071,7 @@ def main() -> None:
             emudhra,
             listen_host=args.listen_host or "127.0.0.1",
             open_browser=not args.no_browser,
+            block_replay=not args.allow_replay,
         )
     except (OSError, RuntimeError) as e:
         _die(f"启动失败：{e}")
