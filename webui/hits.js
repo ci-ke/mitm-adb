@@ -16,13 +16,6 @@
     var hits = {};
     var scheduled = false;
 
-    // 唱片 / 设计图是同类共用一张图，具体是哪几张写在 ids 里，拼到标题前面
-    function label(item) {
-        var text = item.name;
-        if (item.ids && item.ids.length) text += ' #' + item.ids.join('、#');
-        return text;
-    }
-
     function decorate(td, span, id, data) {
         // 已经装饰过：React 偶尔会把 "🔴3" 写回来，这里顺手抹掉编号
         if (td.dataset.myskHit === id && td.querySelector(ICON_SEL)) {
@@ -38,11 +31,10 @@
         wrap.setAttribute('data-hit', id);
 
         data.items.forEach(function (item) {
-            var name = label(item);
             var img = document.createElement('img');
             img.src = item.icon;
-            img.alt = name;
-            img.title = name + ' ×' + item.count + (item.where ? '（' + item.where + '）' : '');
+            img.alt = item.name;
+            img.title = item.name + ' ×' + item.count + (item.where ? '（' + item.where + '）' : '');
             wrap.appendChild(img);
         });
 

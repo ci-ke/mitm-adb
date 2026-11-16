@@ -130,6 +130,8 @@
     变成「🔴编号」，并在红圈左边显示对应图标（webui/hits.js 注入 mitmweb 前端）。
     唱片 / 设计图的「有没有」取自同一份响应的 updatedResources.userMysekaiMusicRecords
     与 userMysekaiBlueprints：不在清单里才算新，清单缺失（判断不了）则不标。
+    掉在固定宝箱（fixture 112，treasure_box_fixed）上的唱片不属于哪张地图的随机刷新
+    点，浮层里不写地图名，直接写「固定位置」（设计图不从固定箱出，不受影响）。
     只在 Web UI 里体现，控制台不打印命中记录——连续采集时那会把屏刷掉。
 
 不落盘，不写 flows 文件。
@@ -534,10 +536,11 @@ def _describe(hosts: tuple[str, ...], ignore: tuple[str, ...]) -> str:
 
 # 掉落物 resourceType == "mysekai_material" 且 resourceId 命中这四样就报出来。
 # id 与图标取自 master 数据（iconAssetbundleName），图标文件已复制到 webui/icon/。
+# **书写顺序就是图标在列表里的顺序**（钻石→夕桐→四叶草→空白的音色），改这里等于改 UI。
 RARE_MATERIALS: dict[int, tuple[str, str]] = {
     12: ("钻石", "item_mineral_7.png"),
-    20: ("四叶草", "item_plant_1.png"),
     5: ("夕桐", "item_wood_5.png"),
+    20: ("四叶草", "item_plant_1.png"),
     24: ("空白的音色", "item_tone_8.png"),
 }
 
@@ -563,8 +566,8 @@ class Collectible:
     """清单条目里的主键字段名。"""
 
 
-# resourceType -> 定义。清单缺失时不标（见 scan_harvest_maps），所以这里不必配
-# "默认认为没有" 之类的开关。
+# resourceType -> 定义，顺序即图标顺序（新唱片 → 新设计图，排在素材之后）。
+# 清单缺失时不标（见 scan_harvest_maps），所以这里不必配"默认认为没有"之类的开关。
 COLLECTIBLES: dict[str, Collectible] = {
     "mysekai_music_record": Collectible(
         label="新唱片",
@@ -583,27 +586,26 @@ COLLECTIBLES: dict[str, Collectible] = {
 # 场景 id → 名字（取自 master 的 sites 表）
 SITE_NAMES: dict[int, str] = {5: "初始空地", 6: "心愿沙滩", 7: "烂漫花田", 8: "忘却之所"}
 
+# 固定位置的宝箱：master 的 mysekaiSiteHarvestFixtures 里只有 112 是
+# treasure_box_fixed（111 是 treasure_box_transport，会换位置）。掉在这种箱子上的
+# 唱片不属于哪张地图的随机刷新点，标签里直接写「固定位置」。
+# 设计图不会从固定箱里出，所以实际只有唱片会命中这里。
+FIXED_FIXTURE_IDS: frozenset[int] = frozenset({112})
+
+# 「固定位置」既是浮层里的文案，也是 sites 里用来顶替 siteId 的 key
+FIXED_POSITION: str = "固定位置"
+
 # 前端注入资源所在目录（hits.js / hits.css / icon/）
 WEBUI_DIR: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui")
 
 
 class MaterialItem(TypedDict):
-    """单个素材条目，webui/hits.js 按这几个字段渲染图标与浮层。"""
+    """单个条目，webui/hits.js 按这几个字段渲染图标与浮层。"""
 
     name: str
     icon: str
     count: int
     where: str
-
-
-class CollectibleItem(TypedDict):
-    """唱片 / 设计图的条目：同类合成一个图标，ids 里列出具体是哪几张。"""
-
-    name: str
-    icon: str
-    count: int
-    where: str
-    ids: list[int]
 
 
 class Hit(TypedDict):
@@ -611,7 +613,7 @@ class Hit(TypedDict):
 
     path: str
     time: str
-    items: list[MaterialItem | CollectibleItem]
+    items: list[MaterialItem]
 
 
 class HitRecord(TypedDict):
@@ -641,25 +643,63 @@ _hit_seq: int = 0
 _webui_installed: bool = False
 
 
-def _split_harvest_map(entry: Any) -> tuple[Any, list[Any]]:
+def _as_list(value: Any) -> list[Any]:
+    """msgpack 里数组可能是 list 也可能是 tuple，统一成 list；别的类型当空。"""
+    return list(value) if isinstance(value, (list, tuple)) else []
+
+
+def _split_harvest_map(entry: Any) -> tuple[Any, list[Any], list[Any]]:
     """harvest map 有两种编码：旧版 dict，现行版 [siteId, fixtures, drops]。"""
     if isinstance(entry, dict):
-        drops = entry.get("userMysekaiSiteHarvestResourceDrops")
-        return entry.get("mysekaiSiteId"), drops if isinstance(drops, list) else []
+        return (
+            entry.get("mysekaiSiteId"),
+            _as_list(entry.get("userMysekaiSiteHarvestFixtures")),
+            _as_list(entry.get("userMysekaiSiteHarvestResourceDrops")),
+        )
     if isinstance(entry, (list, tuple)) and len(entry) >= 3:
-        drops = entry[2]
-        return entry[0], list(drops) if isinstance(drops, (list, tuple)) else []
-    return None, []
+        return entry[0], _as_list(entry[1]), _as_list(entry[2])
+    return None, [], []
 
 
-def _split_drop(drop: Any) -> tuple[Any, Any, float]:
+def _split_fixture(fixture: Any) -> tuple[Any, Any, Any]:
+    """固定物同样两种编码：dict 或 [id, x, z, rotation, status, ...]。"""
+    if isinstance(fixture, dict):
+        return (
+            fixture.get("mysekaiSiteHarvestFixtureId"),
+            fixture.get("positionX"),
+            fixture.get("positionZ"),
+        )
+    if isinstance(fixture, (list, tuple)) and len(fixture) >= 3:
+        return fixture[0], fixture[1], fixture[2]
+    return None, None, None
+
+
+def _split_drop(drop: Any) -> tuple[Any, Any, float, Any, Any]:
     """掉落物同样两种编码：dict 或 [type, id, x, z, ..., quantity(7), ...]。"""
     if isinstance(drop, dict):
-        return drop.get("resourceType"), drop.get("resourceId"), drop.get("quantity", 1)
+        return (
+            drop.get("resourceType"),
+            drop.get("resourceId"),
+            drop.get("quantity", 1),
+            drop.get("positionX"),
+            drop.get("positionZ"),
+        )
     if isinstance(drop, (list, tuple)) and len(drop) >= 2:
         qty = drop[7] if len(drop) > 7 else 1
-        return drop[0], drop[1], qty
-    return None, None, 0
+        x = drop[2] if len(drop) > 2 else None
+        z = drop[3] if len(drop) > 3 else None
+        return drop[0], drop[1], qty, x, z
+    return None, None, 0, None, None
+
+
+def _pos_key(x: Any, z: Any) -> tuple[float, float] | None:
+    """坐标归一成可比较的 key；不是数字（或缺失）就返回 None。
+
+    取三位小数再比：同一格在两种编码里可能是 15 / 15.0，不能直接 == 比。
+    """
+    if isinstance(x, (int, float)) and isinstance(z, (int, float)):
+        return (round(float(x), 3), round(float(z), 3))
+    return None
 
 
 def _add_drop(bucket: dict[int, HitRecord], rid: int, qty: Any, site_id: Any) -> None:
@@ -717,9 +757,23 @@ def scan_harvest_maps(obj: Any) -> HarvestScan | None:
     scan = HarvestScan(materials={}, collectibles={})
 
     for entry in maps:
-        site_id, drops = _split_harvest_map(entry)
+        site_id, fixtures, drops = _split_harvest_map(entry)
+
+        # 这一场景里固定宝箱（treasure_box_fixed）的位置，掉在上面的唱片不按地图算
+        fixed_spots: set[tuple[float, float]] = set()
+        for fixture in fixtures:
+            fid, fx, fz = _split_fixture(fixture)
+            try:
+                if int(fid) not in FIXED_FIXTURE_IDS:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            spot = _pos_key(fx, fz)
+            if spot is not None:
+                fixed_spots.add(spot)
+
         for drop in drops:
-            rtype, rid, qty = _split_drop(drop)
+            rtype, rid, qty, px, pz = _split_drop(drop)
             try:
                 rid = int(rid)
             except (TypeError, ValueError):
@@ -737,15 +791,27 @@ def scan_harvest_maps(obj: Any) -> HarvestScan | None:
             if have is None or rid in have:
                 # 判断不了拥有状态，或者本来就有 —— 不显示图标
                 continue
-            _add_drop(scan.collectibles.setdefault(rtype, {}), rid, qty, site_id)
+            place: Any = site_id
+            if fixed_spots and _pos_key(px, pz) in fixed_spots:
+                place = FIXED_POSITION
+            _add_drop(scan.collectibles.setdefault(rtype, {}), rid, qty, place)
     return scan
 
 
 def _site_text(sites: dict[Any, int]) -> str:
-    """把 {siteId: 数量} 拼成「初始空地×2、心愿沙滩×1」。"""
-    return "、".join(
-        f"{SITE_NAMES.get(sid, f'场景{sid}')}×{n}" for sid, n in sorted(sites.items())
-    )
+    """把 {siteId: 数量} 拼成「初始空地×2、心愿沙滩×1」；固定位置也照样带数量。"""
+    parts: list[str] = []
+    for key, n in sorted(sites.items(), key=lambda kv: _place_order(kv[0])):
+        name = FIXED_POSITION if key == FIXED_POSITION else SITE_NAMES.get(key, f"场景{key}")
+        parts.append(f"{name}×{n}")
+    return "、".join(parts)
+
+
+def _place_order(key: Any) -> tuple[int, float, str]:
+    """排序用：数字 siteId 按大小排前面，字符串（固定位置）排后面。"""
+    if isinstance(key, (int, float)):
+        return (0, float(key), "")
+    return (1, 0.0, str(key))
 
 
 def register_hit(scan: HarvestScan, flow: http.HTTPFlow) -> str:
@@ -754,7 +820,7 @@ def register_hit(scan: HarvestScan, flow: http.HTTPFlow) -> str:
     _hit_seq += 1
     hit_id = str(_hit_seq)
 
-    items: list[MaterialItem | CollectibleItem] = []
+    items: list[MaterialItem] = []
     for rid, (name, icon) in RARE_MATERIALS.items():
         rec = scan.materials.get(rid)
         if not rec:
@@ -769,7 +835,7 @@ def register_hit(scan: HarvestScan, flow: http.HTTPFlow) -> str:
         )
 
     # 唱片 / 设计图：同类合成一个图标。图片在 master 里本来就是通用图，
-    # 一张张画出来只是把同一张图重复 N 遍，具体是哪几张放进浮层的 ids。
+    # 一张张画出来只是把同一张图重复 N 遍。
     for rtype, spec in COLLECTIBLES.items():
         records = scan.collectibles.get(rtype)
         if not records:
@@ -784,7 +850,6 @@ def register_hit(scan: HarvestScan, flow: http.HTTPFlow) -> str:
                 "icon": f"/local/icon/{spec.icon}",
                 "count": sum(rec["count"] for rec in records.values()),
                 "where": _site_text(sites),
-                "ids": sorted(records),
             }
         )
 
