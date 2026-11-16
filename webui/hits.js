@@ -1,7 +1,8 @@
 /*
  * 稀有素材标记（mitmweb 前端注入）
  *
- * 后端在有钻石/四叶草/夕桐/空白的音色时，把该 flow 的 marked 设成 "🔴<编号>"。
+ * 后端在出现稀有素材（钻石/四叶草/夕桐/空白的音色），或者掉出还没拥有的
+ * 唱片 / 设计图时，把该 flow 的 marked 设成 "🔴<编号>"。
  * mitmweb 会把 marked 渲染成 <span class="marker float-right">，于是列表里出现一个红圈。
  * 本脚本按编号去 /local/hits.json 取素材清单，把对应的素材图片插到红圈的**左边**。
  *
@@ -14,6 +15,13 @@
     var ICON_SEL = '.mysk-icons';
     var hits = {};
     var scheduled = false;
+
+    // 唱片 / 设计图是同类共用一张图，具体是哪几张写在 ids 里，拼到标题前面
+    function label(item) {
+        var text = item.name;
+        if (item.ids && item.ids.length) text += ' #' + item.ids.join('、#');
+        return text;
+    }
 
     function decorate(td, span, id, data) {
         // 已经装饰过：React 偶尔会把 "🔴3" 写回来，这里顺手抹掉编号
@@ -30,10 +38,11 @@
         wrap.setAttribute('data-hit', id);
 
         data.items.forEach(function (item) {
+            var name = label(item);
             var img = document.createElement('img');
             img.src = item.icon;
-            img.alt = item.name;
-            img.title = item.name + ' ×' + item.count + (item.where ? '（' + item.where + '）' : '');
+            img.alt = name;
+            img.title = name + ' ×' + item.count + (item.where ? '（' + item.where + '）' : '');
             wrap.appendChild(img);
         });
 

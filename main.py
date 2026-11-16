@@ -126,8 +126,10 @@
 
 稀有素材标记:
     解出的 JSON 里若带 updatedResources.userMysekaiHarvestMaps，会扫一遍掉落物，
-    命中预设的几种稀有素材时，该条 flow 的标记变成「🔴编号」，
-    并在红圈左边显示素材图标（webui/hits.js 注入 mitmweb 前端）。
+    命中预设的几种稀有素材、或掉出**还没拥有**的唱片 / 设计图时，该条 flow 的标记
+    变成「🔴编号」，并在红圈左边显示对应图标（webui/hits.js 注入 mitmweb 前端）。
+    唱片 / 设计图的「有没有」取自同一份响应的 updatedResources.userMysekaiMusicRecords
+    与 userMysekaiBlueprints：不在清单里才算新，清单缺失（判断不了）则不标。
     只在 Web UI 里体现，控制台不打印命中记录——连续采集时那会把屏刷掉。
 
 不落盘，不写 flows 文件。
@@ -539,6 +541,45 @@ RARE_MATERIALS: dict[int, tuple[str, str]] = {
     24: ("空白的音色", "item_tone_8.png"),
 }
 
+
+@dataclass(frozen=True)
+class Collectible:
+    """一类"只关心有没有"的道具（唱片 / 设计图）。
+
+    掉落本身不稀奇，只有拿到手之前还没有的那一张才值得看一眼，所以判断依据是
+    同一份响应里的持有清单，而不是掉落本身。
+    """
+
+    label: str
+    """展示名，也是浮层标题的前缀。"""
+
+    icon: str
+    """webui/icon/ 下的文件名（同类共用一张，master 里本来也只有通用图）。"""
+
+    owned_key: str
+    """updatedResources 里持有清单的字段名。"""
+
+    id_key: str
+    """清单条目里的主键字段名。"""
+
+
+# resourceType -> 定义。清单缺失时不标（见 scan_harvest_maps），所以这里不必配
+# "默认认为没有" 之类的开关。
+COLLECTIBLES: dict[str, Collectible] = {
+    "mysekai_music_record": Collectible(
+        label="新唱片",
+        icon="item_surplus_music_record.png",
+        owned_key="userMysekaiMusicRecords",
+        id_key="mysekaiMusicRecordId",
+    ),
+    "mysekai_blueprint": Collectible(
+        label="新设计图",
+        icon="item_surplus_blueprint.png",
+        owned_key="userMysekaiBlueprints",
+        id_key="mysekaiBlueprintId",
+    ),
+}
+
 # 场景 id → 名字（取自 master 的 sites 表）
 SITE_NAMES: dict[int, str] = {5: "初始空地", 6: "心愿沙滩", 7: "烂漫花田", 8: "忘却之所"}
 
@@ -555,12 +596,22 @@ class MaterialItem(TypedDict):
     where: str
 
 
+class CollectibleItem(TypedDict):
+    """唱片 / 设计图的条目：同类合成一个图标，ids 里列出具体是哪几张。"""
+
+    name: str
+    icon: str
+    count: int
+    where: str
+    ids: list[int]
+
+
 class Hit(TypedDict):
     """一次命中：哪条请求、什么时候、掉了什么。"""
 
     path: str
     time: str
-    items: list[MaterialItem]
+    items: list[MaterialItem | CollectibleItem]
 
 
 class HitRecord(TypedDict):
@@ -568,6 +619,20 @@ class HitRecord(TypedDict):
 
     count: int
     sites: dict[Any, int]
+
+
+@dataclass
+class HarvestScan:
+    """一份响应扫出来的东西；两边都空就当没命中。"""
+
+    materials: dict[int, HitRecord]
+    """resourceId -> 汇总（稀有素材）。"""
+
+    collectibles: dict[str, dict[int, HitRecord]]
+    """resourceType -> (资源 id -> 汇总)；只收还没拥有的那部分。"""
+
+    def empty(self) -> bool:
+        return not self.materials and not self.collectibles
 
 
 # 命中登记表：编号 -> Hit，由 webui/hits.js 拉取
@@ -597,12 +662,46 @@ def _split_drop(drop: Any) -> tuple[Any, Any, float]:
     return None, None, 0
 
 
-def scan_harvest_maps(obj: Any) -> dict[int, HitRecord] | None:
+def _add_drop(bucket: dict[int, HitRecord], rid: int, qty: Any, site_id: Any) -> None:
+    """把一次掉落累计进汇总；数量不合法时按 1 算。"""
+    n = int(qty) if isinstance(qty, (int, float)) and qty > 0 else 1
+    rec = bucket.setdefault(rid, {"count": 0, "sites": {}})
+    rec["count"] += n
+    rec["sites"][site_id] = rec["sites"].get(site_id, 0) + n
+
+
+def _owned_ids(resources: dict[str, Any], spec: Collectible) -> set[int] | None:
+    """把持有清单读成 id 集合；判断不了时返回 None。
+
+    清单齐全时它就是玩家的全部持有量，不在里面 = 还没有。判断不了的三种情况：
+    字段缺失（这份响应没带清单，比如只回了个增量）、不是列表、以及清单非空却
+    一条 id 都读不出来（多半是字段名/编码变了）。这几种**都不能**把"不在清单里"
+    当成"没有"，否则会把一堆早就有过的东西全标成新的。
+    """
+    raw = resources.get(spec.owned_key)
+    if not isinstance(raw, list):
+        return None
+    owned: set[int] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            owned.add(int(entry[spec.id_key]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not owned and raw:
+        return None
+    return owned
+
+
+def scan_harvest_maps(obj: Any) -> HarvestScan | None:
     """扫一遍 harvest map 里的掉落物。
 
-    返回 None  -> 这份 JSON 没有 updatedResources.userMysekaiHarvestMaps
-    返回 {}    -> 有该结构，但四样稀有素材一个都没有
-    返回 {id: {"count": n, "sites": {siteId: n}}} -> 命中
+    返回 None -> 这份 JSON 没有 updatedResources.userMysekaiHarvestMaps
+    否则返回 HarvestScan，用 empty() 判断有没有值得报的东西：
+
+        稀有素材             资源 id 命中 RARE_MATERIALS 就收
+        唱片 / 设计图        必须"这份响应带了持有清单，且 id 不在清单里"才收
     """
     if not isinstance(obj, dict):
         return None
@@ -613,46 +712,79 @@ def scan_harvest_maps(obj: Any) -> dict[int, HitRecord] | None:
     if not isinstance(maps, list):
         return None
 
-    found: dict[int, HitRecord] = {}
+    # 先读持有清单：None = 判断不了，这类掉落直接跳过
+    owned = {rtype: _owned_ids(resources, spec) for rtype, spec in COLLECTIBLES.items()}
+    scan = HarvestScan(materials={}, collectibles={})
+
     for entry in maps:
         site_id, drops = _split_harvest_map(entry)
         for drop in drops:
             rtype, rid, qty = _split_drop(drop)
-            if rtype != "mysekai_material":
-                continue
             try:
                 rid = int(rid)
             except (TypeError, ValueError):
                 continue
-            if rid not in RARE_MATERIALS:
+
+            if rtype == "mysekai_material":
+                if rid in RARE_MATERIALS:
+                    _add_drop(scan.materials, rid, qty, site_id)
                 continue
-            n = int(qty) if isinstance(qty, (int, float)) and qty > 0 else 1
-            rec = found.setdefault(rid, {"count": 0, "sites": {}})
-            rec["count"] += n
-            rec["sites"][site_id] = rec["sites"].get(site_id, 0) + n
-    return found
+
+            spec = COLLECTIBLES.get(rtype) if isinstance(rtype, str) else None
+            if spec is None:
+                continue
+            have = owned[rtype]
+            if have is None or rid in have:
+                # 判断不了拥有状态，或者本来就有 —— 不显示图标
+                continue
+            _add_drop(scan.collectibles.setdefault(rtype, {}), rid, qty, site_id)
+    return scan
 
 
-def register_hit(found: dict[int, HitRecord], flow: http.HTTPFlow) -> str:
+def _site_text(sites: dict[Any, int]) -> str:
+    """把 {siteId: 数量} 拼成「初始空地×2、心愿沙滩×1」。"""
+    return "、".join(
+        f"{SITE_NAMES.get(sid, f'场景{sid}')}×{n}" for sid, n in sorted(sites.items())
+    )
+
+
+def register_hit(scan: HarvestScan, flow: http.HTTPFlow) -> str:
     """登记一次命中，返回编号（同时用作 flow 的标记）。"""
     global _hit_seq
     _hit_seq += 1
     hit_id = str(_hit_seq)
 
-    items: list[MaterialItem] = []
+    items: list[MaterialItem | CollectibleItem] = []
     for rid, (name, icon) in RARE_MATERIALS.items():
-        rec = found.get(rid)
+        rec = scan.materials.get(rid)
         if not rec:
             continue
-        where = "、".join(
-            f"{SITE_NAMES.get(sid, f'场景{sid}')}×{n}" for sid, n in sorted(rec["sites"].items())
-        )
         items.append(
             {
                 "name": name,
                 "icon": f"/local/icon/{icon}",
                 "count": rec["count"],
-                "where": where,
+                "where": _site_text(rec["sites"]),
+            }
+        )
+
+    # 唱片 / 设计图：同类合成一个图标。图片在 master 里本来就是通用图，
+    # 一张张画出来只是把同一张图重复 N 遍，具体是哪几张放进浮层的 ids。
+    for rtype, spec in COLLECTIBLES.items():
+        records = scan.collectibles.get(rtype)
+        if not records:
+            continue
+        sites: dict[Any, int] = {}
+        for rec in records.values():
+            for sid, n in rec["sites"].items():
+                sites[sid] = sites.get(sid, 0) + n
+        items.append(
+            {
+                "name": spec.label,
+                "icon": f"/local/icon/{spec.icon}",
+                "count": sum(rec["count"] for rec in records.values()),
+                "where": _site_text(sites),
+                "ids": sorted(records),
             }
         )
 
@@ -740,10 +872,10 @@ class ResponseDecrypt:
 
         dup.comment = ("[decrypted] " + (flow.comment or "")).strip()
 
-        # 响应里带 harvest map 就顺手看一眼有没有稀有素材
-        found = scan_harvest_maps(resp_obj) if resp_obj is not None else None
-        if found:
-            dup.marked = "🔴" + register_hit(found, flow)
+        # 响应里带 harvest map 就顺手看一眼：稀有素材 / 还没拥有的唱片、设计图
+        scan = scan_harvest_maps(resp_obj) if resp_obj is not None else None
+        if scan is not None and not scan.empty():
+            dup.marked = "🔴" + register_hit(scan, flow)
         else:
             # mitmweb 会在列表的 Path 列渲染这个标记，用来和原始密文包区分
             dup.marked = MARKER
@@ -2256,7 +2388,9 @@ def start_ui(
     else:
         print("  解密   : 关闭（DECRYPT_HOSTS 为空）")
     if secrets is not None and rules.effective_decrypt():
-        print(f"  素材   : {'、'.join(n for n, _ in RARE_MATERIALS.values())}")
+        names = [n for n, _ in RARE_MATERIALS.values()]
+        names += [spec.label for spec in COLLECTIBLES.values()]
+        print(f"  素材   : {'、'.join(names)}")
     print("  Ctrl+C 结束" + ("（被动模式无需还原设备）" if passive else "并自动清理"))
     print("=" * 66)
     print()
