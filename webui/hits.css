@@ -37,3 +37,13 @@ html[data-theme="light"] .mysk-icons img {
     background: rgba(0, 0, 0, 0.07);
     filter: drop-shadow(0 0 0.6px rgba(0, 0, 0, 0.75));
 }
+
+/*
+ * 详情面板里的 Comment：结构是 <section class="timing"><h4>Comment</h4>
+ * <span class="kv-value">…</span></section>。kv-value 默认 white-space: normal，
+ * 换行会塌成空格，点开 flow 只能看到挤成一坨的一行——这里才是要看的地方。
+ */
+section.timing > h4 + .kv-value {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}

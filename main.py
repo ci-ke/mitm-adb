@@ -127,7 +127,8 @@
 稀有素材标记:
     解出的 JSON 里若带 updatedResources.userMysekaiHarvestMaps，会扫一遍掉落物，
     命中预设的几种稀有素材、或掉出**还没拥有**的唱片 / 设计图时，该条 flow 的标记
-    变成「🔴编号」，并在红圈左边显示对应图标（webui/hits.js 注入 mitmweb 前端）。
+    变成「🔴编号」，comment 里逐行写下素材名、数量和地点（可用 ~comment 筛），
+    并在红圈左边显示对应图标（webui/hits.js 注入 mitmweb 前端）。
     唱片 / 设计图的「有没有」取自同一份响应的 updatedResources.userMysekaiMusicRecords
     与 userMysekaiBlueprints：不在清单里才算新，清单缺失（判断不了）则不标。
     掉在固定宝箱（fixture 112，treasure_box_fixed）上的唱片不属于哪张地图的随机刷新
@@ -814,8 +815,8 @@ def _place_order(key: Any) -> tuple[int, float, str]:
     return (1, 0.0, str(key))
 
 
-def register_hit(scan: HarvestScan, flow: http.HTTPFlow) -> str:
-    """登记一次命中，返回编号（同时用作 flow 的标记）。"""
+def register_hit(scan: HarvestScan, flow: http.HTTPFlow) -> tuple[str, str]:
+    """登记一次命中，返回 (编号, comment 摘要)。编号同时用作 flow 的标记。"""
     global _hit_seq
     _hit_seq += 1
     hit_id = str(_hit_seq)
@@ -861,7 +862,27 @@ def register_hit(scan: HarvestScan, flow: http.HTTPFlow) -> str:
     # 只保留最近的若干条，避免长时间抓包把内存堆起来
     while len(HITS) > 500:
         HITS.pop(next(iter(HITS)), None)
-    return hit_id
+    # comment 里一行一个素材，并带上地点——比图标浮层好复制，也能被 ~comment 筛到
+    summary = "\n".join(_item_text(item) for item in items)
+    return hit_id, summary
+
+
+def _item_text(item: MaterialItem) -> str:
+    """comment 里的一行：`钻石×2（忘却之所×2）`。"""
+    where = f"（{item['where']}）" if item["where"] else ""
+    return f'{item["name"]}×{item["count"]}{where}'
+
+
+def _comment_text(original: str | None, summary: str) -> str:
+    """comment = 「[decrypted] + 每个素材一行 + 原内容」，空的部分跳过。
+
+    没有命中时保持原来的单行格式（`[decrypted] 原内容`），只有命中才折成多行——
+    多行只在带图标的那一行放开（见 hits.css），别把普通行的排版也改了。
+    摘要用中文素材名，主要是为了能在 mitmweb 里直接 `~comment 钻石` 筛出来。
+    """
+    if not summary:
+        return ("[decrypted] " + (original or "")).strip()
+    return "\n".join(part for part in ("[decrypted]", summary, original or "") if part)
 
 
 def _decrypt_aes_cbc(data: bytes, secrets: DecryptSecrets) -> bytes:
@@ -935,15 +956,17 @@ class ResponseDecrypt:
             dup.response.headers["content-type"] = "application/json; charset=utf-8"
             dup.response.headers["x-decrypted"] = "1"
 
-        dup.comment = ("[decrypted] " + (flow.comment or "")).strip()
-
         # 响应里带 harvest map 就顺手看一眼：稀有素材 / 还没拥有的唱片、设计图
         scan = scan_harvest_maps(resp_obj) if resp_obj is not None else None
+        summary = ""
         if scan is not None and not scan.empty():
-            dup.marked = "🔴" + register_hit(scan, flow)
+            hit_id, summary = register_hit(scan, flow)
+            dup.marked = "🔴" + hit_id
         else:
             # mitmweb 会在列表的 Path 列渲染这个标记，用来和原始密文包区分
             dup.marked = MARKER
+
+        dup.comment = _comment_text(flow.comment, summary)
         return dup
 
     def response(self, flow: http.HTTPFlow) -> None:
